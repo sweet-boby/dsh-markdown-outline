@@ -772,16 +772,41 @@ function foldHiddenTurns(events) {
         unlink(item.turn);
         const seqs = item.seqs.filter((seq) => typeof seq === 'number');
         for (const seq of seqs) bySeq.set(seq, item.turn);
-        turns.set(item.turn, { turn: item.turn, hideSeq: event.seq, seqs });
+        turns.set(item.turn, { turn: item.turn, hideSeq: event.seq, seqs, visible: false });
       }
     } else {
+      // Restoring shows the turn again but cannot put its content back into
+      // the model context: a replacement that shadowed those nodes is not
+      // reversible. Keep the turn in the ledger with its shadowed seqs so a
+      // later hide knows the context work is already done, and mark it
+      // visible so the transcript and outline show it.
       for (const turn of data.turns) {
-        if (typeof turn === 'number') unlink(turn);
+        if (typeof turn !== 'number') continue;
+        const entry = turns.get(turn);
+        if (entry === undefined) continue;
+        turns.set(turn, { ...entry, visible: true });
       }
     }
   }
 
   return { turns, bySeq, seq: lastSeq };
+}
+
+/**
+ * Turns the outline and transcript should currently show as hidden.
+ *
+ * A restored turn stays in {@link foldHiddenTurns}'s ledger — its context was
+ * already shadowed — but it is visible again, so it belongs in neither the
+ * hidden list nor the transcript filter.
+ * @param {ReadonlyArray<any>} events
+ * @returns {number[]} hidden turn numbers, ascending.
+ */
+function hiddenTurnNumbers(events) {
+  const { turns } = foldHiddenTurns(events);
+  return [...turns.values()]
+    .filter((entry) => entry.visible !== true)
+    .map((entry) => entry.turn)
+    .sort((a, b) => a - b);
 }
 
 /**
@@ -1092,8 +1117,36 @@ export function apply(ctx) {
               observation[Symbol.dispose]();
             }
           }
+          // A turn whose content an earlier hide already shadowed is only a UI
+          // concern now: its context work is done and cannot be redone. Record
+          // the hide without touching the surface so hiding a restored turn
+          // works instead of failing on content that is already gone.
+          const ledger = foldHiddenTurns(observation?.events ?? []);
+          const alreadyShadowed = turns.filter((turn) => ledger.turns.has(turn));
           if (picked.turns.length === 0) {
-            sendJson(res, 409, { code: 'nothing-to-hide', message: 'the selected turns carry no model-visible content' });
+            if (alreadyShadowed.length === 0) {
+              sendJson(res, 409, { code: 'nothing-to-hide', message: 'the selected turns carry no model-visible content' });
+              return;
+            }
+            try {
+              appendPluginRecord(session, HIDE_RECORD, {
+                // Keep the seqs an earlier hide recorded: they are what a later
+                // restore needs to know the context work is already done.
+                turns: alreadyShadowed.map((turn) => ({
+                  turn,
+                  seqs: ledger.turns.get(turn)?.seqs ?? [],
+                })),
+                hiddenAt: Date.now(),
+                uiOnly: true,
+              });
+            } catch (error) {
+              sendJson(res, 500, {
+                code: 'hide-failed',
+                message: error instanceof Error ? error.message : 'hiding failed',
+              });
+              return;
+            }
+            sendJson(res, 200, { hidden: alreadyShadowed, uiOnly: true });
             return;
           }
           // One replacement shadows one contiguous range, so unselected turns
@@ -1222,6 +1275,7 @@ export const internals = {
   searchBlockBody,
   searchSessionAssistantEvents,
   foldHiddenTurns,
+  hiddenTurnNumbers,
   foldLiveSurface,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,

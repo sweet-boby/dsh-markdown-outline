@@ -16,6 +16,7 @@ import {
 
 const {
   foldHiddenTurns,
+  hiddenTurnNumbers,
   foldLiveSurface,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,
@@ -108,10 +109,22 @@ test('the hide ledger folds hides and restores per turn', () => {
   ledger = foldHiddenTurns(log)
   assert.deepEqual([...ledger.turns.keys()].sort((a, b) => a - b), [1, 2, 3])
 
+  // Restoring shows the turn again but cannot return its content to the model
+  // context, so the ledger keeps it and only its visibility changes.
   appendRestoreRecord(log, [2, 3], RESTORE_RECORD)
   ledger = foldHiddenTurns(log)
-  assert.deepEqual([...ledger.turns.keys()], [1])
-  assert.equal(ledger.bySeq.size, 2, 'restored turns drop their seqs from the shadow map')
+  assert.deepEqual([...ledger.turns.keys()].sort((a, b) => a - b), [1, 2, 3], 'a restored turn stays in the ledger')
+  assert.equal(ledger.turns.get(2).visible, true, 'the restored turn is marked visible')
+  assert.equal(ledger.turns.get(1).visible, false, 'the untouched turn stays hidden')
+  assert.equal(ledger.bySeq.size, 7, 'shadowed seqs stay recorded for a later hide')
+
+  // Only currently-hidden turns are published to the outline and transcript.
+  assert.deepEqual(hiddenTurnNumbers(log), [1])
+
+  // Hiding the restored turn again returns it to the hidden set without
+  // touching the context.
+  appendHideRecord(log, [{ turn: 2, seqs: [9, 10, 11] }], HIDE_RECORD)
+  assert.deepEqual(hiddenTurnNumbers(log), [1, 2])
 })
 
 test('the ledger ignores records without an ignorable marker', () => {
@@ -270,4 +283,37 @@ test('the live surface drops the replacement range and keeps its replacement', (
   const after = internals.foldLiveSurface(log)
   for (const seq of seqs) assert.ok(!after.has(seq), 'shadowed nodes leave the surface')
   assert.ok(after.has(log.length - 1), 'the replacement itself is on the surface')
+})
+
+test('a turn hidden after being restored stays hidden without its context', () => {
+  const log = buildSessionLog(TURNS)
+  const live = internals.foldLiveSurface(log)
+
+  // First hide takes turn 2 out of the model context.
+  const picked = surfaceSeqsOfTurns(log, new Set([2]), live)
+  const run = splitIntoContiguousRuns(picked.byTurn)[0]
+  log.push({
+    type: 'user/message',
+    seq: log.length,
+    time: 0,
+    data: { id: 'hide1', role: 'user', content: [{ type: 'text', text: '<hidden>' }], source: { kind: 'hidden-turns' } },
+    surfaceOp: { op: 'replace', startSeq: run.seqs[0], endSeq: run.seqs[run.seqs.length - 1] },
+    sourceEventSeqs: run.seqs,
+  })
+  appendHideRecord(log, picked.byTurn, HIDE_RECORD)
+  assert.deepEqual(hiddenTurnNumbers(log), [2])
+
+  // Restoring shows it again; the content stays out of the model context.
+  appendRestoreRecord(log, [2], RESTORE_RECORD)
+  assert.deepEqual(hiddenTurnNumbers(log), [], 'a restored turn is visible')
+  assert.equal(foldHiddenTurns(log).turns.get(2).seqs.length > 0, true, 'its shadowed seqs are remembered')
+
+  // Hiding it again is a UI-only change: nothing is left on the surface to
+  // replace, and the ledger says the context work is already done.
+  const afterRestore = internals.foldLiveSurface(log)
+  const second = surfaceSeqsOfTurns(log, new Set([2]), afterRestore)
+  assert.deepEqual(second.seqs, [], 'no surface work remains')
+
+  appendHideRecord(log, [{ turn: 2, seqs: [] }], HIDE_RECORD)
+  assert.deepEqual(hiddenTurnNumbers(log), [2], 'the turn is hidden again')
 })
