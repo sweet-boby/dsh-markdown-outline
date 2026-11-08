@@ -25,6 +25,8 @@ window.__ModuleLoader__.load({
     const SNIPPET_RADIUS = 36;
     /** Longest reference body sent with one prompt, in characters. */
     const MAX_REFERENCE_CHARS = 60_000;
+    /** Shared empty list for a session with no hidden turns; a stable identity keeps hooks quiet. */
+    const EMPTY_TURNS = Object.freeze([]);
 
     const EN_DICT = {
       title: 'Outline',
@@ -1969,25 +1971,6 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function IconEyeOff() {
-      return h(
-        'svg',
-        { viewBox: '0 0 14 14', width: 11, height: 11, fill: 'none', 'aria-hidden': 'true' },
-        h('path', {
-          d: 'M1.6 7S3.7 3.2 7 3.2 12.4 7 12.4 7 10.3 10.8 7 10.8 1.6 7 1.6 7z',
-          stroke: 'currentColor',
-          strokeWidth: '1.2',
-        }),
-        h('circle', { cx: '7', cy: '7', r: '1.7', stroke: 'currentColor', strokeWidth: '1.2' }),
-        h('path', {
-          d: 'M2.4 11.6L11.6 2.4',
-          stroke: 'currentColor',
-          strokeWidth: '1.2',
-          strokeLinecap: 'round',
-        }),
-      );
-    }
-
     /**
      * Flatten one turn group's outline rows into display order, carrying the
      * ancestor heading titles so a reference keeps its section path.
@@ -2677,11 +2660,6 @@ window.__ModuleLoader__.load({
             [selection.entries],
           );
           const hiddenTurnNums = hiddenState.bySession[bridge.sessionId] ?? EMPTY_TURNS;
-          const hiddenSet = useMemo(() => new Set(hiddenTurnNums), [hiddenTurnNums]);
-
-          const showNotice = useCallback((text) => {
-            setNotice({ text, at: Date.now() });
-          }, []);
 
           useEffect(() => {
             if (notice === null) return undefined;
