@@ -2265,6 +2265,8 @@ window.__ModuleLoader__.load({
         selecting: false,
         sidebarOpen: false,
         confirmIds: null,
+        /** The section opened from a composer chip, shown in the sidebar. */
+        preview: null,
       };
       const listeners = new Set();
       const read = () => state;
@@ -2299,6 +2301,9 @@ window.__ModuleLoader__.load({
         clearEntries: () => write({ ...state, entries: [], selecting: false }),
         /** Confirm the live selection as the reference that travels with the message. */
         attachEntries: () => write({ ...state, attached: [...state.entries], selecting: false, sidebarOpen: false }),
+        /** Show one referenced section's detail, opened from its composer chip. */
+        openPreview: (preview) => write({ ...state, preview, sidebarOpen: true }),
+        closePreview: () => write({ ...state, preview: null, sidebarOpen: false }),
         /** Drop the attached reference without touching the live selection. */
         detach: () => write({ ...state, attached: [], sidebarOpen: false }),
         requestHide: (ids) => write({ ...state, confirmIds: ids }),
@@ -2314,6 +2319,7 @@ window.__ModuleLoader__.load({
           selecting: false,
           sidebarOpen: false,
           confirmIds: null,
+          preview: null,
         }),
       };
     }

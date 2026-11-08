@@ -292,3 +292,22 @@ test('detaching removes the block and keeps the typed text', () => {
   assert.ok(!current.includes('<md-outline-reference>'), 'the block is gone')
   assert.match(current, /我发给了你啥/, 'the typed text stays')
 })
+
+test('the card opens the detail for the confirmed reference', () => {
+  const { internals } = loadClient()
+  const store = internals.createSelectionStore()
+
+  store.toggleEntry(ENTRY)
+  store.attachEntries()
+  assert.equal(store.read().sidebarOpen, false, 'confirming does not force the sidebar open')
+
+  // Opening a chip's preview shows that section and its full text.
+  store.openPreview({ id: 'a', turn: 22, heading: '第一层', body: '全文内容' })
+  assert.equal(store.read().sidebarOpen, true, 'opening a preview shows the sidebar')
+  assert.equal(store.read().preview.heading, '第一层')
+  assert.equal(store.read().preview.body, '全文内容')
+
+  store.closePreview()
+  assert.equal(store.read().preview, null)
+  assert.equal(store.read().sidebarOpen, false)
+})
