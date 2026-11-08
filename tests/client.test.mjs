@@ -127,8 +127,57 @@ test('the conversation hides hidden turns by rule without wrapping renderers', (
   assert.match(rule, /display: none !important/)
 })
 
-test('no transcript rule is installed when nothing is hidden', () => {
+test('an empty hidden set leaves the transcript sheet blank', () => {
   const { head } = renderOutline({ hiddenTurns: [] })
-  const rule = head.find((element) => String(element.textContent).includes('data-chat-turn'))
-  assert.equal(rule, undefined)
+  const sheet = head.find((element) =>
+    element.attributes['data-dsh-plugin'] === 'dsh-markdown-outline-transcript')
+  assert.ok(sheet !== undefined, 'the plugin still installs its sheet')
+  assert.equal(String(sheet.textContent), '', 'nothing is hidden, so the sheet carries no rule')
+})
+
+test('the hiding rule survives the outline unmounting', () => {
+  // The sheet belongs to the plugin, not to a component: hiding turns keeps
+  // working even when the outline column is not mounted (another session, a
+  // collapsed surface, or a remount mid-render).
+  const { registered, head } = loadClient()
+  const bridge = registered.get('md-outline-session-bridge')
+
+  bridge({
+    sessionId: 'session-1',
+    useSession: hookOf(fixed({ running: false, hasMore: false })),
+    useChat: hookOf(fixed({ order: [], nodes: { get: () => undefined }, navigation: { items: () => [] } })),
+    useProjection: () => ({ turns: TURNS, hiddenTurns: [22] }),
+    loadThrough: () => undefined,
+  })
+
+  const sheet = head.find((element) =>
+    element.attributes['data-dsh-plugin'] === 'dsh-markdown-outline-transcript')
+  assert.ok(sheet !== undefined, 'the plugin installs one transcript sheet at mount')
+
+  const outline = registered.get('conversation.header.leading')
+  const props = loadClient().injected.get('conversation.header.leading')
+  assert.ok(props !== undefined)
+
+  // Rendering the outline writes into the sheet produced during apply().
+  const mounted = loadClient()
+  const mountedBridge = mounted.registered.get('md-outline-session-bridge')
+  mountedBridge({
+    sessionId: 'session-1',
+    useSession: hookOf(fixed({ running: false, hasMore: false })),
+    useChat: hookOf(fixed({ order: [], nodes: { get: () => undefined }, navigation: { items: () => [] } })),
+    useProjection: () => ({ turns: TURNS, hiddenTurns: [22] }),
+    loadThrough: () => undefined,
+  })
+  mounted.registered.get('conversation.header.leading')({
+    useOutlineBridge: hookOf(mounted.injected.get('conversation.header.leading').hooks.outlineBridge),
+    useSelection: hookOf(fixed({ entries: [], selecting: false, sidebarOpen: false, confirmIds: null })),
+    useHiddenTurns: hookOf(fixed({ bySession: {} })),
+    t: (key) => key,
+  })
+
+  const written = mounted.head.find((element) =>
+    element.attributes['data-dsh-plugin'] === 'dsh-markdown-outline-transcript')
+  assert.ok(written !== undefined, 'the sheet exists for the whole Client run')
+  assert.match(String(written.textContent), /\[data-chat-turn="22"\]/)
+  assert.ok(outline !== undefined)
 })

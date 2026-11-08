@@ -2348,6 +2348,32 @@ window.__ModuleLoader__.load({
         const selectionStore = createSelectionStore();
         const hiddenStore = createHiddenStore();
 
+        // One plugin-owned stylesheet carries the transcript rule for the whole
+        // Client run. Writing it here rather than inside a component keeps the
+        // rule in place across session switches and component remounts.
+        let transcriptSheet = null;
+        ctx.effect(() => {
+          const styleEl = document.createElement('style');
+          styleEl.setAttribute('data-dsh-plugin', 'dsh-markdown-outline-transcript');
+          document.head.appendChild(styleEl);
+          transcriptSheet = styleEl;
+          return () => {
+            transcriptSheet = null;
+            styleEl.remove();
+          };
+        });
+
+        /**
+         * Publish the transcript hiding rule for the current hidden turns.
+         * @param {ReadonlyArray<number>} turns - hidden turn numbers; empty clears the rule.
+         */
+        function publishTranscriptRule(turns) {
+          if (transcriptSheet === null) return;
+          transcriptSheet.textContent = turns.length === 0
+            ? ''
+            : `${turns.map((turn) => `[data-chat-turn="${turn}"]`).join(',\n')} { display: none !important; }`;
+        }
+
         function publishBridge(next) {
           bridgeState = next;
           for (const fn of bridgeListeners) fn();
@@ -2776,19 +2802,10 @@ window.__ModuleLoader__.load({
 
           // The transcript marks every rendered row with data-chat-turn, so a
           // hidden turn leaves the conversation by rule rather than by wrapping
-          // the shipped renderers. The style element lives and dies with this
-          // component, which keeps the page clean when the plugin unloads.
+          // the shipped renderers. The rule is written through the plugin-owned
+          // sheet, which outlives this component.
           useEffect(() => {
-            if (hiddenTurnNums.length === 0 || typeof document === 'undefined') return undefined;
-            const styleEl = document.createElement('style');
-            styleEl.setAttribute('data-dsh-plugin', 'dsh-markdown-outline-transcript');
-            styleEl.textContent = hiddenTurnNums
-              .map((turn) => `[data-chat-turn="${turn}"]`)
-              .join(',\n') + ' { display: none !important; }';
-            document.head.appendChild(styleEl);
-            return () => {
-              styleEl.remove();
-            };
+            publishTranscriptRule(hiddenTurnNums);
           }, [hiddenTurnNums]);
 
           useEffect(() => {
