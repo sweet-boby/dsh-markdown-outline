@@ -3821,24 +3821,11 @@ window.__ModuleLoader__.load({
                                             ? `${item.text} (${t('loadingTurn')})`
                                             : item.text,
                                           'aria-current': isActive ? 'location' : undefined,
+                                          // Jumping is what the label always does; ticking a
+                                          // section belongs to its checkbox alone, so a click
+                                          // meant for navigation never changes the selection.
                                           onClick: () => {
-                                            // In selection mode a label click toggles the
-                                            // checkbox; jumping stays on the plain outline.
-                                            if (!selecting) {
-                                              void jumpToItem(item, group);
-                                              return;
-                                            }
-                                            const found = flattenGroupRows(group).find(
-                                              (row) => row.item.id === item.id,
-                                            );
-                                            selectionStore.toggleEntry(
-                                              buildSectionSelection(
-                                                group,
-                                                item,
-                                                bridge.allSteps,
-                                                found?.path ?? [],
-                                              ),
-                                            );
+                                            void jumpToItem(item, group);
                                           },
                                         },
                                         item.text,
