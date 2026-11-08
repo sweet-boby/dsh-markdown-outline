@@ -999,25 +999,26 @@ export function apply(ctx) {
   // message. `agent/pre-step` is the seam that owns what enters a step, so the
   // reference arrives as one extra user message and the composer stays plain
   // text. The record is cleared in the same step that consumes it.
-  ctx.inject(['sessions'], (scope) => {
-    scope.on('agent/pre-step', async (payload, next) => {
-      const decision = await next();
-      if (decision.kind !== 'enter') return decision;
-      const pending = foldPendingReference(payload.agent.session.snapshotEvents());
-      if (pending === undefined) return decision;
-      return {
-        ...decision,
-        messages: [
-          ...decision.messages,
-          {
-            id: `md-outline-reference-${pending.seq}`,
-            role: 'user',
-            content: [{ type: 'text', text: pending.text }],
-            source: { kind: 'outline-reference', plugin: 'dsh-markdown-outline' },
-          },
-        ],
-      };
-    });
+  // Scoped events dispatch to listeners on the Agent's own context chain, so
+  // this must be registered on the plugin's top-level context rather than
+  // inside an `inject()` scope: a scoped listener never sees the event.
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next();
+    if (decision.kind !== 'enter') return decision;
+    const pending = foldPendingReference(payload.agent.session.snapshotEvents());
+    if (pending === undefined) return decision;
+    return {
+      ...decision,
+      messages: [
+        ...decision.messages,
+        {
+          id: `md-outline-reference-${pending.seq}`,
+          role: 'user',
+          content: [{ type: 'text', text: pending.text }],
+          source: { kind: 'outline-reference', plugin: 'dsh-markdown-outline' },
+        },
+      ],
+    };
   });
 
   ctx.inject(['webServer', 'connection', 'sessions', 'sessionQuery'], (scope) => {

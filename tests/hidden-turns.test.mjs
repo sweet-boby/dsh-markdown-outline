@@ -250,3 +250,78 @@ test('a reference without the ignorable marker is ignored', () => {
   })
   assert.equal(internals.foldPendingReference(log), undefined)
 })
+
+test('the reference enters the step as one extra user message', async () => {
+  // Drive the listener the plugin registers, with the smallest context it uses.
+  const { apply } = await import('../index.js')
+  const listeners = new Map()
+  const ctx = {
+    on: (name, handler) => listeners.set(name, handler),
+    inject: () => {},
+  }
+  apply(ctx)
+
+  const handler = listeners.get('agent/pre-step')
+  assert.ok(handler !== undefined, 'the plugin registers a pre-step listener')
+
+  const log = buildSessionLog(TURNS)
+  log.push({
+    type: internals.REFERENCE_RECORD,
+    seq: log.length,
+    time: 0,
+    ignorable: true,
+    data: { text: '<md-outline-reference>attached</md-outline-reference>', at: 0 },
+  })
+
+  const decision = await handler(
+    { agent: { session: { snapshotEvents: () => log } }, turn: 1, step: 1 },
+    async () => ({ kind: 'enter', messages: [{ id: 'prompt', role: 'user', content: [] }] }),
+  )
+
+  assert.equal(decision.kind, 'enter')
+  assert.equal(decision.messages.length, 2, 'the reference rides along as one more message')
+  assert.match(decision.messages[1].content[0].text, /<md-outline-reference>attached/)
+})
+
+test('a step without an attachment is left untouched', async () => {
+  const { apply } = await import('../index.js')
+  const listeners = new Map()
+  apply({ on: (name, handler) => listeners.set(name, handler), inject: () => {} })
+
+  const decision = await listeners.get('agent/pre-step')(
+    { agent: { session: { snapshotEvents: () => buildSessionLog(TURNS) } }, turn: 1, step: 1 },
+    async () => ({ kind: 'enter', messages: [{ id: 'prompt', role: 'user', content: [] }] }),
+  )
+
+  assert.equal(decision.messages.length, 1, 'no attachment, no extra message')
+})
+
+test('the pre-step listener is registered on the context that sees agent events', async () => {
+  const { apply } = await import('../index.js')
+
+  // Scoped events dispatch on the Agent's context chain. A listener registered
+  // inside an `inject()` scope never receives them, so it must sit on the
+  // plugin's top-level context.
+  const topLevel = []
+  const scoped = []
+  const ctx = {
+    on: (name) => topLevel.push(name),
+    inject: (_deps, callback) => {
+      callback({
+        on: (name) => scoped.push(name),
+        effect: () => () => {},
+        sessionProjections: { register: () => () => {} },
+        systemPrompt: { context: () => () => {} },
+        webServer: { register: () => () => {} },
+        connection: {},
+        sessions: { get: () => undefined, list: () => [] },
+        sessionQuery: {},
+      })
+    },
+  }
+
+  apply(ctx)
+
+  assert.ok(topLevel.includes('agent/pre-step'), 'registered on the top-level context')
+  assert.ok(!scoped.includes('agent/pre-step'), 'a scoped registration would never fire')
+})
