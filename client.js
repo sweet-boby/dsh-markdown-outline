@@ -11,6 +11,21 @@ window.__ModuleLoader__.load({
       useState,
     } = React;
 
+    /**
+     * Render one overlay outside the outline's own column.
+     *
+     * The column is a 0-width anchor with an absolutely positioned panel, so a
+     * fixed-position dialog inside it inherits that cramped containing block
+     * and loses its width. A portal puts the dialog on `document.body` instead.
+     * @param {object} node - the element to mount elsewhere.
+     * @returns {object} the portal, or the node itself when portals are unavailable.
+     */
+    function renderOverlay(node) {
+      const portal = React.createPortal;
+      if (typeof portal !== 'function' || typeof document === 'undefined') return node;
+      return portal(node, document.body);
+    }
+
     const NS = 'dsh-markdown-outline';
     const STORAGE_OPEN_KEY = 'dsh.mdOutline.open';
     const STORAGE_WIDTH_KEY = 'dsh.mdOutline.width';
@@ -436,21 +451,22 @@ window.__ModuleLoader__.load({
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   flex: none;
   border: 1.5px solid var(--dsw-alias-border-l2, var(--dsw-alias-border-l1));
   border-radius: 4px;
   box-sizing: border-box;
-  background: transparent;
+  background: var(--dsw-alias-bg-base);
   color: var(--dsw-alias-bg-base);
   cursor: pointer;
   padding: 0;
-  transition: background-color 120ms ease, border-color 120ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease, transform 120ms ease;
 }
 
 .dsh-mdo-check:hover {
   border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  transform: scale(1.06);
 }
 
 .dsh-mdo-check[data-checked="true"] {
@@ -756,6 +772,8 @@ window.__ModuleLoader__.load({
   align-items: center;
   gap: 8px;
   flex: none;
+  box-sizing: border-box;
+  min-height: 36px;
   padding: 6px 12px;
   border-top: 0.5px solid var(--dsw-alias-border-l1);
   background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
@@ -764,9 +782,22 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary);
 }
 
+/* The hide action shares the bar with its count; keep the button compact so a
+   narrow column never clips it. */
+.dsh-mdo-hide-bar .dsh-mdo-btn {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .dsh-mdo-hide-bar-text {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dsh-mdo-confirm {
@@ -862,6 +893,21 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
 }
 
+/* A selected row keeps one background across checkbox, fold chevron, and label
+   so the selection reads as one block rather than a loose checkbox. */
+.dsh-mdo-row[data-checked="true"] {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary)) 10%, transparent);
+}
+
+.dsh-mdo-row[data-checked="true"]:hover {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary)) 15%, transparent);
+}
+
+.dsh-mdo-row[data-checked="true"] .dsh-mdo-item-btn {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
 .dsh-mdo-row[data-active="true"]::before {
   content: '';
   position: absolute;
@@ -873,6 +919,10 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary));
 }
 
+.dsh-mdo-row[data-active="true"][data-checked="true"]::before {
+  background: var(--dsw-alias-label-primary);
+}
+
 .dsh-mdo-fold-slot {
   display: inline-flex;
   align-items: center;
@@ -880,6 +930,31 @@ window.__ModuleLoader__.load({
   width: 16px;
   height: 28px;
   flex: none;
+}
+
+/* One fixed track for the selection checkbox in every row, so the checkbox
+   column and the fold column line up across nesting levels. */
+.dsh-mdo-check-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 28px;
+  flex: none;
+}
+
+/* Indentation guides: each extra nesting level draws a thin rule, which keeps
+   deep rows readable once the checkbox column shifts the text right. */
+.dsh-mdo-row[data-level]:not([data-level="0"])::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 1px;
+  border-radius: 1px;
+  background: var(--dsw-alias-border-l1);
+  opacity: 0.7;
+  pointer-events: none;
 }
 
 .dsh-mdo-fold-btn {
@@ -2494,51 +2569,55 @@ window.__ModuleLoader__.load({
               )
             : null;
 
+          const sidebarOverlay = sidebar === null ? null : renderOverlay(sidebar);
+
           const confirmDialog = confirmIds === null
             ? null
-            : h(
-                React.Fragment,
-                null,
-                h('div', {
-                  className: 'dsh-mdo-confirm-scrim',
-                  onClick: () => selectionStore.cancelHide(),
-                }),
+            : renderOverlay(
                 h(
-                  'div',
-                  { className: 'dsh-mdo-confirm', role: 'dialog', 'aria-modal': 'true' },
+                  React.Fragment,
+                  null,
+                  h('div', {
+                    className: 'dsh-mdo-confirm-scrim',
+                    onClick: () => selectionStore.cancelHide(),
+                  }),
                   h(
                     'div',
-                    { className: 'dsh-mdo-confirm-title' },
-                    t('hideTurns', { count: selectedTurns.length }),
-                  ),
-                  h('p', { className: 'dsh-mdo-confirm-text' }, t('hideTurnsExplain')),
-                  h(
-                    'div',
-                    { className: 'dsh-mdo-confirm-actions' },
+                    { className: 'dsh-mdo-confirm', role: 'dialog', 'aria-modal': 'true' },
                     h(
-                      'button',
-                      {
-                        type: 'button',
-                        className: 'dsh-mdo-btn',
-                        disabled: busy,
-                        onClick: () => selectionStore.cancelHide(),
-                      },
-                      t('hideCancel'),
+                      'div',
+                      { className: 'dsh-mdo-confirm-title' },
+                      t('hideTurns', { count: selectedTurns.length }),
                     ),
+                    h('p', { className: 'dsh-mdo-confirm-text' }, t('hideTurnsExplain')),
                     h(
-                      'button',
-                      {
-                        type: 'button',
-                        className: 'dsh-mdo-btn',
-                        'data-danger': 'true',
-                        disabled: busy || selectedTurns.length === 0,
-                        onClick: async () => {
-                          const ids = confirmIds;
-                          selectionStore.finishHide(ids);
-                          await applyHidden(selectedTurns, HIDE_ROUTE);
+                      'div',
+                      { className: 'dsh-mdo-confirm-actions' },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-mdo-btn',
+                          disabled: busy,
+                          onClick: () => selectionStore.cancelHide(),
                         },
-                      },
-                      busy ? t('hiding') : t('hideConfirm'),
+                        t('hideCancel'),
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-mdo-btn',
+                          'data-danger': 'true',
+                          disabled: busy || selectedTurns.length === 0,
+                          onClick: async () => {
+                            const ids = confirmIds;
+                            selectionStore.finishHide(ids);
+                            await applyHidden(selectedTurns, HIDE_ROUTE);
+                          },
+                        },
+                        busy ? t('hiding') : t('hideConfirm'),
+                      ),
                     ),
                   ),
                 ),
@@ -2560,7 +2639,7 @@ window.__ModuleLoader__.load({
             React.Fragment,
             null,
             card,
-            sidebar,
+            sidebarOverlay,
             confirmDialog,
             noticeLine,
           );
@@ -3509,39 +3588,44 @@ window.__ModuleLoader__.load({
                                         'data-outline-id': item.id,
                                         'data-active': isActive ? 'true' : undefined,
                                         'data-sub': item.level > 0 ? 'true' : undefined,
+                                        'data-level': item.level,
                                         'data-jumping': isJumping ? 'true' : undefined,
                                         'data-checked': isChecked ? 'true' : undefined,
                                         style: {
                                           paddingLeft: `${4 + item.level * 14}px`,
                                         },
                                       },
-                                      selecting
-                                        ? h(
-                                            'button',
-                                            {
-                                              type: 'button',
-                                              className: 'dsh-mdo-check',
-                                              'data-checked': isChecked ? 'true' : undefined,
-                                              'aria-checked': isChecked,
-                                              role: 'checkbox',
-                                              'aria-label': item.text,
-                                              onClick: () => {
-                                                const found = flattenGroupRows(group).find(
-                                                  (row) => row.item.id === item.id,
-                                                );
-                                                selectionStore.toggleEntry(
-                                                  buildSectionSelection(
-                                                    group,
-                                                    item,
-                                                    bridge.allSteps,
-                                                    found?.path ?? [],
-                                                  ),
-                                                );
+                                      h(
+                                        'span',
+                                        { className: 'dsh-mdo-check-slot' },
+                                        selecting
+                                          ? h(
+                                              'button',
+                                              {
+                                                type: 'button',
+                                                className: 'dsh-mdo-check',
+                                                'data-checked': isChecked ? 'true' : undefined,
+                                                'aria-checked': isChecked,
+                                                role: 'checkbox',
+                                                'aria-label': item.text,
+                                                onClick: () => {
+                                                  const found = flattenGroupRows(group).find(
+                                                    (row) => row.item.id === item.id,
+                                                  );
+                                                  selectionStore.toggleEntry(
+                                                    buildSectionSelection(
+                                                      group,
+                                                      item,
+                                                      bridge.allSteps,
+                                                      found?.path ?? [],
+                                                    ),
+                                                  );
+                                                },
                                               },
-                                            },
-                                            isChecked ? h(IconCheck) : null,
-                                          )
-                                        : null,
+                                              isChecked ? h(IconCheck) : null,
+                                            )
+                                          : null,
+                                      ),
                                       h(
                                         'span',
                                         { className: 'dsh-mdo-fold-slot' },
@@ -3574,7 +3658,23 @@ window.__ModuleLoader__.load({
                                             : item.text,
                                           'aria-current': isActive ? 'location' : undefined,
                                           onClick: () => {
-                                            void jumpToItem(item, group);
+                                            // In selection mode a label click toggles the
+                                            // checkbox; jumping stays on the plain outline.
+                                            if (!selecting) {
+                                              void jumpToItem(item, group);
+                                              return;
+                                            }
+                                            const found = flattenGroupRows(group).find(
+                                              (row) => row.item.id === item.id,
+                                            );
+                                            selectionStore.toggleEntry(
+                                              buildSectionSelection(
+                                                group,
+                                                item,
+                                                bridge.allSteps,
+                                                found?.path ?? [],
+                                              ),
+                                            );
                                           },
                                         },
                                         item.text,
@@ -3774,7 +3874,7 @@ window.__ModuleLoader__.load({
                                 new Set(selection.entries.map((it) => it.id)),
                               ),
                           },
-                          t('hideTurns', { count: selection.entries.length }),
+                          t('hideConfirm'),
                         ),
                       )
                     : null,
