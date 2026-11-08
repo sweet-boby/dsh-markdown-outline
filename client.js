@@ -2199,10 +2199,14 @@ window.__ModuleLoader__.load({
      */
     function buildHeadlessSelection(group, allSteps) {
       const steps = (allSteps ?? []).filter((candidate) => candidate.turn === group.turn);
-      const body = steps
+      let body = steps
         .flatMap((step) => step.texts ?? [])
         .join('\n')
         .trim();
+      // A turn whose reply failed carries only its prompt. That is still a turn
+      // the reader can see and may want to hide, so the prompt stands in for the
+      // content instead of leaving the checkbox dead.
+      if (body === '') body = (group.prompt ?? '').trim();
       if (body === '') return null;
       const heading = group.prompt === '' ? `第 ${group.turn} 轮` : group.prompt;
       return {

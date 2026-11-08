@@ -330,6 +330,25 @@ test('a headingless turn contributes its whole reply as one selectable entry', (
   assert.equal(entry.body, '第一段回复\n第二段回复', 'only this turn text is quoted')
   assert.equal(entry.id, 't59:headless', 'the id is stable so the checkbox can find it')
 
-  // A turn with no text at all contributes nothing rather than an empty entry.
-  assert.equal(build({ turn: 59, prompt: 'p' }, []), null)
+  // With no reply text the prompt carries the entry; only a turn with neither
+  // contributes nothing.
+  assert.equal(build({ turn: 59, prompt: 'p' }, []).body, 'p')
+  assert.equal(build({ turn: 59, prompt: '' }, []), null)
+})
+
+test('a turn whose reply failed is still selectable from its prompt', () => {
+  const { internals } = loadClient()
+  const build = internals.buildHeadlessSelection
+
+  // The reply never arrived (transport error), so there is no step text.
+  const entry = build({ turn: 61, prompt: '行，你根据大纲写一份完整的飞书文档吧' }, [])
+
+  assert.ok(entry !== null, 'a prompt-only turn still produces an entry')
+  assert.equal(entry.turn, 61)
+  assert.equal(entry.heading, '行，你根据大纲写一份完整的飞书文档吧')
+  assert.equal(entry.body, '行，你根据大纲写一份完整的飞书文档吧', 'the prompt stands in for the missing reply')
+  assert.equal(entry.id, 't61:headless')
+
+  // A turn with neither reply nor prompt contributes nothing.
+  assert.equal(build({ turn: 61, prompt: '' }, []), null)
 })
