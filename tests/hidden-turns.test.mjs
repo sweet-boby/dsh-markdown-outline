@@ -317,3 +317,69 @@ test('a turn hidden after being restored stays hidden without its context', () =
   appendHideRecord(log, [{ turn: 2, seqs: [] }], HIDE_RECORD)
   assert.deepEqual(hiddenTurnNumbers(log), [2], 'the turn is hidden again')
 })
+
+test('a reply with no headings still becomes a turn in the outline', () => {
+  const definition = mdOutlineProjectionDefinition
+  let state = definition.init()
+
+  state = definition.apply(state, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+  state = definition.apply(state, {
+    type: 'user/message',
+    seq: 2,
+    data: { id: 'p1', role: 'user', content: [{ type: 'text', text: 'just talk to me' }], source: { kind: 'user' } },
+  })
+  state = definition.apply(state, {
+    type: 'assistant/message',
+    seq: 3,
+    data: {
+      id: 'a1',
+      turn: 1,
+      step: 1,
+      message: { content: [{ type: 'text', text: '好的，已经完成，没有使用任何标题。' }] },
+    },
+  })
+
+  assert.equal(state.visibleTurns.length, 1, 'the turn is listed')
+  assert.equal(state.visibleTurns[0].turn, 1)
+  assert.deepEqual(state.visibleTurns[0].steps, [], 'it contributes no heading steps')
+
+  // A later reply with headings keeps the headless turn listed alongside it.
+  state = definition.apply(state, { type: 'turn/start', seq: 4, data: { turn: 2 } })
+  state = definition.apply(state, {
+    type: 'user/message',
+    seq: 5,
+    data: { id: 'p2', role: 'user', content: [{ type: 'text', text: 'second' }], source: { kind: 'user' } },
+  })
+  state = definition.apply(state, {
+    type: 'assistant/message',
+    seq: 6,
+    data: {
+      id: 'a2',
+      turn: 2,
+      step: 1,
+      message: { content: [{ type: 'text', text: '## 有标题的一轮\n\n正文' }] },
+    },
+  })
+
+  assert.deepEqual(state.visibleTurns.map((t) => t.turn), [1, 2])
+  assert.equal(state.visibleTurns[1].steps[0].headings.length, 1)
+})
+
+test('a turn is listed as soon as its prompt arrives', () => {
+  const definition = mdOutlineProjectionDefinition
+  let state = definition.init()
+
+  state = definition.apply(state, { type: 'turn/start', seq: 1, data: { turn: 1 } })
+  assert.deepEqual(state.visibleTurns, [], 'a fresh turn lists nothing yet')
+
+  // The prompt alone must list the turn: its reply may carry no headings, so
+  // the assistant branch is not a reliable place for it to appear.
+  state = definition.apply(state, {
+    type: 'user/message',
+    seq: 2,
+    data: { id: 'p1', role: 'user', content: [{ type: 'text', text: 'talk to me' }], source: { kind: 'user' } },
+  })
+  assert.deepEqual(state.visibleTurns.map((t) => t.turn), [1], 'the prompt lists the turn')
+  assert.equal(state.visibleTurns[0].prompt, 'talk to me')
+  assert.deepEqual(state.visibleTurns[0].steps, [])
+})

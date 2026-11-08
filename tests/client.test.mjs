@@ -311,3 +311,25 @@ test('the card opens the detail for the confirmed reference', () => {
   assert.equal(store.read().preview, null)
   assert.equal(store.read().sidebarOpen, false)
 })
+
+test('a headingless turn contributes its whole reply as one selectable entry', () => {
+  const { internals } = loadClient()
+  const build = internals.buildHeadlessSelection
+
+  const entry = build(
+    { turn: 59, prompt: '让飞书里把方案写完整' },
+    [
+      { turn: 59, step: 1, texts: ['第一段回复', '第二段回复'] },
+      { turn: 60, step: 1, texts: ['别的轮次'] },
+    ],
+  )
+
+  assert.ok(entry !== null, 'a turn with text produces an entry')
+  assert.equal(entry.turn, 59)
+  assert.equal(entry.heading, '让飞书里把方案写完整', 'the prompt names the entry')
+  assert.equal(entry.body, '第一段回复\n第二段回复', 'only this turn text is quoted')
+  assert.equal(entry.id, 't59:headless', 'the id is stable so the checkbox can find it')
+
+  // A turn with no text at all contributes nothing rather than an empty entry.
+  assert.equal(build({ turn: 59, prompt: 'p' }, []), null)
+})

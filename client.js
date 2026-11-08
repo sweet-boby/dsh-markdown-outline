@@ -1677,7 +1677,21 @@ window.__ModuleLoader__.load({
         const lt = loadedByTurn.get(turnNum);
         const pt = projectedByTurn.get(turnNum);
         const sourceSteps = isLoaded ? (lt ? lt.steps : []) : (pt ? pt.steps : []);
-        if (!sourceSteps || sourceSteps.length === 0) continue;
+        // A turn whose reply has no headings still gets a group: the reader can
+        // still jump to it and tick it, and an empty group is how the outline
+        // says "this turn has nothing to list".
+        const prompt = (lt?.prompt || pt?.prompt || '').trim();
+        if (!sourceSteps || sourceSteps.length === 0) {
+          groups.push({
+            turn: turnNum,
+            prompt,
+            turnStartSeq: pt?.seq,
+            loaded: isLoaded,
+            items: [],
+            headless: true,
+          });
+          continue;
+        }
 
         const rawItems = [];
         for (const stepEntry of sourceSteps) {
@@ -1698,7 +1712,17 @@ window.__ModuleLoader__.load({
             });
           }
         }
-        if (rawItems.length === 0) continue;
+        if (rawItems.length === 0) {
+          groups.push({
+            turn: turnNum,
+            prompt,
+            turnStartSeq: pt?.seq,
+            loaded: isLoaded,
+            items: [],
+            headless: true,
+          });
+          continue;
+        }
 
         // Normalize indentation per turn so e.g. H2+H3 starts flush at level 0
         let minDepth = 6;
@@ -1734,7 +1758,7 @@ window.__ModuleLoader__.load({
 
         groups.push({
           turn: turnNum,
-          prompt: (lt?.prompt || pt?.prompt || '').trim(),
+          prompt,
           turnStartSeq: pt?.seq,
           loaded: isLoaded,
           items,
@@ -2164,6 +2188,37 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Build the selection a headingless turn contributes.
+     *
+     * Such a turn has no rows to tick, but the reader still needs to select it —
+     * to quote the reply or to hide the turn — so its whole reply stands in for
+     * one section.
+     * @param {object} group - the turn's outline group.
+     * @param {ReadonlyArray<object>} allSteps - loaded steps carrying block text.
+     * @returns {object | null} the selection, or null when the turn has no text.
+     */
+    function buildHeadlessSelection(group, allSteps) {
+      const steps = (allSteps ?? []).filter((candidate) => candidate.turn === group.turn);
+      const body = steps
+        .flatMap((step) => step.texts ?? [])
+        .join('\n')
+        .trim();
+      if (body === '') return null;
+      const heading = group.prompt === '' ? `第 ${group.turn} 轮` : group.prompt;
+      return {
+        id: `t${group.turn}:headless`,
+        kind: 'section',
+        turn: group.turn,
+        step: 0,
+        prompt: group.prompt ?? '',
+        heading,
+        path: [],
+        depth: 1,
+        body,
+      };
+    }
+
+    /**
      * Render the selected sections as the reference block inserted into the composer.
      * File references in `@path` form are spelled `@ path` so the composer's
      * mention trigger does not rewrite them.
@@ -2235,7 +2290,7 @@ window.__ModuleLoader__.load({
      * Selection state machine, exposed for the unit tests that assert the
      * confirm gate. This is the only consumer besides `apply`.
      */
-    const selectionInternals = { createSelectionStore };
+    const selectionInternals = { createSelectionStore, buildHeadlessSelection };
 
     const EMPTY_BRIDGE = Object.freeze({
       active: false,
@@ -3670,8 +3725,9 @@ window.__ModuleLoader__.load({
                             // A turn counts as ticked when every one of its headings is
                             // selected; the header checkbox then writes that whole set.
                             const turnChecked =
-                              group.items.length > 0 &&
-                              group.items.every((it) => selectedIds.has(it.id));
+                              group.items.length > 0
+                                ? group.items.every((it) => selectedIds.has(it.id))
+                                : selectedIds.has(`t${group.turn}:headless`);
                             const itemMap = new Map(group.items.map((it) => [it.id, it]));
                             const isHiddenByAncestor = (item) => {
                               let pid = item.parentId;
@@ -3707,6 +3763,16 @@ window.__ModuleLoader__.load({
                                             onClick: () => {
                                               const rows = flattenGroupRows(group);
                                               const next = !turnChecked;
+                                              // A turn with no headings has no rows to
+                                              // tick, so its whole reply is the entry.
+                                              if (rows.length === 0) {
+                                                const entry = buildHeadlessSelection(group, bridge.allSteps);
+                                                if (entry === null) return;
+                                                if (selectedIds.has(entry.id) !== next) {
+                                                  selectionStore.toggleEntry(entry);
+                                                }
+                                                return;
+                                              }
                                               for (const row of rows) {
                                                 const entry = buildSectionSelection(
                                                   group,

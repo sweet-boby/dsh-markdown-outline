@@ -309,12 +309,10 @@ const mdOutlineProjectionDefinition = {
         if (prompt === '') return state;
         const updatedTurn = { ...last, prompt };
         const nextAll = [...state.allTurns.slice(0, -1), updatedTurn];
-        if (last.steps.length === 0) {
-          return { ...state, allTurns: nextAll };
-        }
-        const nextVisible = state.visibleTurns.map((t) =>
-          t.turn === updatedTurn.turn ? updatedTurn : t,
-        );
+        const listed = state.visibleTurns.some((t) => t.turn === updatedTurn.turn);
+        const nextVisible = listed
+          ? state.visibleTurns.map((t) => (t.turn === updatedTurn.turn ? updatedTurn : t))
+          : [...state.visibleTurns, updatedTurn].sort((a, b) => a.turn - b.turn);
         return { ...state, allTurns: nextAll, visibleTurns: nextVisible };
       }
       case 'assistant/message': {
@@ -347,11 +345,11 @@ const mdOutlineProjectionDefinition = {
           for (const h of parsed) headings.push(h);
         }
 
-        if (headings.length === 0 && existingStep === undefined) return state;
-
+        // A reply with no headings still belongs in the outline: it is a turn the
+        // reader can see and may want to hide, so the turn is kept with an empty
+        // step list rather than dropped for having nothing to list.
         let nextAll;
         if (existingTurn === undefined) {
-          if (headings.length === 0) return state;
           const newTurn = {
             turn: turnNum,
             seq: event.seq,
@@ -373,11 +371,8 @@ const mdOutlineProjectionDefinition = {
           );
         }
 
-        const nextVisible = nextAll.filter((t) => t.steps.length > 0);
-        if (nextVisible.length === 0 && state.visibleTurns.length === 0) {
-          return { ...state, allTurns: nextAll };
-        }
-        return { ...state, allTurns: nextAll, visibleTurns: nextVisible };
+        // Every turn the log carries is listed, headings or not.
+        return { ...state, allTurns: nextAll, visibleTurns: nextAll };
       }
       case HIDE_RECORD: {
         const items = Array.isArray(event.data?.turns) ? event.data.turns : [];
