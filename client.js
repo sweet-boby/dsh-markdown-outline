@@ -62,12 +62,11 @@ window.__ModuleLoader__.load({
       selectMode: 'Select sections',
       selectModeOn: 'Exit selection',
       selectedCount: '{count} selected',
-      selectionBar: 'Reference {count} sections in the next message',
+      selectionBar: '{count} referenced — sent with your next message',
       openSelection: 'Open selection',
       selectionTitle: 'Referenced sections',
       selectionClose: 'Close',
       selectionEmpty: 'Nothing selected yet',
-      insertReference: 'Insert into composer',
       clearSelection: 'Clear selection',
       referenceHeading: 'Referenced context',
       hiddenTitle: 'Hidden turns ({count})',
@@ -84,8 +83,6 @@ window.__ModuleLoader__.load({
       hiding: 'Hiding…',
       hideFailed: 'Could not hide turns: {message}',
       restoreFailed: 'Could not restore the turn: {message}',
-      insertFailed: 'Could not insert the reference',
-      selectionPartial: 'The reference was truncated to fit one message',
       hiddenBadge: 'hidden',
     };
 
@@ -108,12 +105,11 @@ window.__ModuleLoader__.load({
       selectMode: '多选章节',
       selectModeOn: '退出多选',
       selectedCount: '已选 {count} 项',
-      selectionBar: '引用 {count} 个章节，随下一条消息一起发送',
+      selectionBar: '已引用 {count} 个章节，随下一条消息一起发送',
       openSelection: '查看引用',
       selectionTitle: '已引用章节',
       selectionClose: '关闭',
       selectionEmpty: '还没有选中任何章节',
-      insertReference: '插入到输入框',
       clearSelection: '清空选择',
       referenceHeading: '引用的上下文',
       hiddenTitle: '已隐藏的轮次 ({count})',
@@ -130,8 +126,6 @@ window.__ModuleLoader__.load({
       hiding: '正在隐藏…',
       hideFailed: '隐藏失败：{message}',
       restoreFailed: '恢复失败：{message}',
-      insertFailed: '无法插入引用',
-      selectionPartial: '内容过长，已截断为一条消息',
       hiddenBadge: '已隐藏',
     };
 
@@ -2193,6 +2187,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Remove every reference block this plugin wrote from a draft.
+     * @param {string} draft - the composer text.
+     * @returns {string} the draft without reference blocks.
+     */
+    function stripReferenceBlocks(draft) {
+      return draft.replace(/<md-outline-reference>[\s\S]*?<\/md-outline-reference>\n*/g, '');
+    }
+
+    /**
      * POST one of this plugin's mutating routes.
      * @param {string} route - route path relative to the page origin.
      * @param {object} payload - JSON body.
@@ -2429,10 +2432,14 @@ window.__ModuleLoader__.load({
          * outline's selections are acted on from here.
          */
         function ReferenceDock(props) {
-          const { useSelection, useHiddenTurns, sessionId, inputActions, t } = props;
+          const { useSelection, useHiddenTurns, sessionId, inputActions, useInput, t } = props;
           const selection = useSelection((s) => s);
+          const draft = useInput((s) => s.draft);
+          const phase = useInput((s) => s.phase);
           const [busy, setBusy] = useState(false);
           const [notice, setNotice] = useState(null);
+          const lastSyncedRef = useRef('');
+          const draftRef = useRef('');
 
           useEffect(() => {
             if (notice === null) return undefined;
@@ -2448,18 +2455,34 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId]);
 
-          const insertReference = useCallback(() => {
-            const entries = selectionStore.read().entries;
-            if (entries.length === 0) return;
-            const { text } = buildReferenceText(entries);
-            const span = inputActions.captureInsertion();
-            const ok = inputActions.insertText(`${text}\n\n`, span);
-            if (!ok) {
-              setNotice({ text: t('insertFailed') });
-              return;
-            }
-            selectionStore.clearEntries();
-          }, [inputActions, t]);
+          // Ticking a heading puts the reference into the draft immediately, so
+          // the next message carries it without a second click. The effect keys
+          // off the selection only: depending on the draft would re-enter every
+          // time this effect writes it, and the write would never settle. The
+          // ref holds the latest draft for the same reason.
+          draftRef.current = draft;
+          useEffect(() => {
+            if (phase !== 'plain') return;
+            const entries = selection.entries;
+            const previous = lastSyncedRef.current;
+            const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
+            // An empty selection still needs one pass to clear, even when this
+            // mount never wrote a block itself.
+            if (next === previous && next !== '') return;
+
+            // Strip whichever reference block the draft already holds, including
+            // one written before this component remounted, so clearing the
+            // selection never leaves an orphan block in the composer.
+            const current = previous !== '' && draftRef.current.includes(previous)
+              ? draftRef.current.split(previous).join('')
+              : stripReferenceBlocks(draftRef.current);
+            const base = current;
+            const trimmed = base.trim();
+            const merged = next === '' ? trimmed : (trimmed === '' ? next : `${next}\n\n${trimmed}`);
+            lastSyncedRef.current = next;
+            draftRef.current = merged;
+            inputActions.setDraft(merged);
+          }, [selection.entries, phase, inputActions]);
 
           const applyHidden = useCallback(async (rawTurns, route) => {
             if (busy) return;
@@ -2599,25 +2622,17 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { className: 'dsh-mdo-side-foot' },
+                  // The reference already travels with the draft; this panel is
+                  // for reading and removing, so it offers no separate insert.
                   h(
                     'button',
                     {
                       type: 'button',
                       className: 'dsh-mdo-btn',
+                      disabled: selection.entries.length === 0,
                       onClick: () => selectionStore.clearEntries(),
                     },
                     t('clearSelection'),
-                  ),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'dsh-mdo-btn',
-                      'data-primary': 'true',
-                      disabled: selection.entries.length === 0,
-                      onClick: insertReference,
-                    },
-                    t('insertReference'),
                   ),
                 ),
               )

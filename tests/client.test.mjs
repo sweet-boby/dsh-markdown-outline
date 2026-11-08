@@ -181,3 +181,112 @@ test('the hiding rule survives the outline unmounting', () => {
   assert.match(String(written.textContent), /\[data-chat-turn="22"\]/)
   assert.ok(outline !== undefined)
 })
+
+/**
+ * Render the composer dock with a live draft so the reference sync can run.
+ * @param {{ entries: object[], draft?: string }} options - selection and draft.
+ * @returns {{ draft: () => string, calls: string[] }} the draft after effects and the writes made.
+ */
+function renderDock({ entries, draft = '' }) {
+  const client = loadClient()
+  const dock = client.registered.get('md-outline-reference')
+  assert.ok(dock !== undefined, 'the composer dock must be registered')
+
+  let current = draft
+  const calls = []
+  const selectionObservable = fixed({
+    entries,
+    selecting: entries.length > 0,
+    sidebarOpen: false,
+    confirmIds: null,
+  })
+
+  // The dock reads its draft through `useInput`; a mutable observable lets the
+  // second render see what the first one wrote.
+  const inputObservable = {
+    getSnapshot: () => ({ draft: current, phase: 'plain' }),
+    subscribe: () => () => {},
+  }
+
+  dock({
+    useSelection: (selector) => selector(selectionObservable.getSnapshot()),
+    useHiddenTurns: (selector) => selector({ bySession: {} }),
+    useInput: (selector) => selector(inputObservable.getSnapshot()),
+    sessionId: 'session-1',
+    inputActions: {
+      captureInsertion: () => ({ draftRev: 0 }),
+      insertText: (text) => {
+        calls.push(`insert:${text}`)
+        return true
+      },
+      setDraft: (text) => {
+        calls.push(`set:${text}`)
+        current = text
+      },
+      persistDraft: () => {},
+    },
+    t: (key, params) => (params === undefined ? key : `${key}:${JSON.stringify(params)}`),
+  })
+
+  return { draft: () => current, calls }
+}
+
+test('ticking a heading puts the reference into the draft without a second click', () => {
+  const entry = {
+    id: 't22:s1:h0',
+    turn: 22,
+    step: 1,
+    prompt: 'fix the search',
+    heading: 'First layer: Chinese tokenization',
+    body: 'Merging results goes through the Go service.',
+    path: [],
+  }
+
+  const { calls } = renderDock({ entries: [entry] })
+  const written = calls.find((call) => call.startsWith('set:'))
+  assert.ok(written !== undefined, 'the reference must reach the draft automatically')
+  assert.match(written, /<md-outline-reference>/)
+  assert.match(written, /First layer: Chinese tokenization/)
+  assert.match(written, /Merging results goes through the Go service/)
+  assert.match(written, /第 22 轮/)
+})
+
+test('the reference keeps the words the user already typed', () => {
+  const entry = {
+    id: 't3:s1:h0',
+    turn: 3,
+    step: 1,
+    prompt: 'p',
+    heading: 'Heading',
+    body: 'Body text.',
+    path: [],
+  }
+
+  const { draft } = renderDock({ entries: [entry], draft: '你给我发了啥' })
+  assert.match(draft(), /<md-outline-reference>/)
+  assert.match(draft(), /你给我发了啥/, 'the typed prompt survives the reference block')
+  assert.ok(
+    draft().indexOf('</md-outline-reference>') < draft().indexOf('你给我发了啥'),
+    'the reference sits above the typed text',
+  )
+})
+
+test('clearing the selection removes the reference from the draft', () => {
+  const entry = {
+    id: 't3:s1:h0',
+    turn: 3,
+    step: 1,
+    prompt: 'p',
+    heading: 'Heading',
+    body: 'Body text.',
+    path: [],
+  }
+
+  const { draft } = renderDock({ entries: [entry], draft: 'keep me' })
+  const withBlock = draft()
+  assert.match(withBlock, /<md-outline-reference>/)
+
+  // A follow-up render with an empty selection must strip the block again.
+  const cleared = renderDock({ entries: [], draft: withBlock })
+  assert.ok(!cleared.draft().includes('<md-outline-reference>'), 'the block is gone')
+})
