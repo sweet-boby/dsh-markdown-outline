@@ -15,12 +15,16 @@ window.__ModuleLoader__.load({
     const STORAGE_OPEN_KEY = 'dsh.mdOutline.open';
     const STORAGE_WIDTH_KEY = 'dsh.mdOutline.width';
     const SEARCH_ROUTE = 'md-outline/search';
+    const HIDE_ROUTE = 'md-outline/hide';
+    const RESTORE_ROUTE = 'md-outline/restore';
     const DEFAULT_WIDTH = 252;
     const MIN_WIDTH = 180;
     const MAX_WIDTH = 420;
     const HEADING_TEXT_LIMIT = 140;
     const MAX_LIVE_BODY_HITS = 80;
     const SNIPPET_RADIUS = 36;
+    /** Longest reference body sent with one prompt, in characters. */
+    const MAX_REFERENCE_CHARS = 60_000;
 
     const EN_DICT = {
       title: 'Outline',
@@ -38,6 +42,34 @@ window.__ModuleLoader__.load({
       searchingOlder: 'Searching earlier history…',
       headingResults: 'Headings ({count})',
       bodyResults: 'Reply text ({count})',
+      selectMode: 'Select sections',
+      selectModeOn: 'Exit selection',
+      selectedCount: '{count} selected',
+      selectionBar: 'Reference {count} sections in the next message',
+      openSelection: 'Open selection',
+      selectionTitle: 'Referenced sections',
+      selectionClose: 'Close',
+      selectionEmpty: 'Nothing selected yet',
+      insertReference: 'Insert into composer',
+      clearSelection: 'Clear selection',
+      referenceHeading: 'Referenced context',
+      hiddenTitle: 'Hidden turns ({count})',
+      hiddenShow: 'Show hidden turns',
+      hiddenHide: 'Hide list',
+      hiddenEmpty: 'No hidden turns',
+      hideTurns: 'Hide {count} turns',
+      hideTurnsExplain:
+        'Hidden turns disappear from this conversation and are not sent to the model. The original log keeps them, so you can restore them at any time.',
+      hideConfirm: 'Hide',
+      hideCancel: 'Cancel',
+      restoreTurn: 'Show again',
+      restoring: 'Restoring…',
+      hiding: 'Hiding…',
+      hideFailed: 'Could not hide turns: {message}',
+      restoreFailed: 'Could not restore the turn: {message}',
+      insertFailed: 'Could not insert the reference',
+      selectionPartial: 'The reference was truncated to fit one message',
+      hiddenBadge: 'hidden',
     };
 
     const ZH_DICT = {
@@ -56,6 +88,34 @@ window.__ModuleLoader__.load({
       searchingOlder: '正在检索早期历史…',
       headingResults: '目录标题 ({count})',
       bodyResults: '正文匹配 ({count})',
+      selectMode: '多选章节',
+      selectModeOn: '退出多选',
+      selectedCount: '已选 {count} 项',
+      selectionBar: '引用 {count} 个章节，随下一条消息一起发送',
+      openSelection: '查看引用',
+      selectionTitle: '已引用章节',
+      selectionClose: '关闭',
+      selectionEmpty: '还没有选中任何章节',
+      insertReference: '插入到输入框',
+      clearSelection: '清空选择',
+      referenceHeading: '引用的上下文',
+      hiddenTitle: '已隐藏的轮次 ({count})',
+      hiddenShow: '查看已隐藏的轮次',
+      hiddenHide: '收起列表',
+      hiddenEmpty: '没有被隐藏的轮次',
+      hideTurns: '隐藏 {count} 个轮次',
+      hideTurnsExplain:
+        '被隐藏的轮次会从这段对话中消失，也不会再发送给模型。原始会话日志仍然保留，随时可以恢复。',
+      hideConfirm: '隐藏',
+      hideCancel: '取消',
+      restoreTurn: '重新显示',
+      restoring: '正在恢复…',
+      hiding: '正在隐藏…',
+      hideFailed: '隐藏失败：{message}',
+      restoreFailed: '恢复失败：{message}',
+      insertFailed: '无法插入引用',
+      selectionPartial: '内容过长，已截断为一条消息',
+      hiddenBadge: '已隐藏',
     };
 
     const STYLESHEET = `
@@ -337,6 +397,417 @@ window.__ModuleLoader__.load({
   font-size: 12px;
   line-height: 18px;
   color: var(--dsw-alias-label-secondary);
+}
+
+/* --- selection mode ------------------------------------------------------ */
+
+.dsh-mdo-select-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+  flex: none;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.dsh-mdo-select-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-mdo-select-btn[data-on="true"] {
+  border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  background: var(--dsw-alias-brand-bg, var(--dsw-alias-bg-layer-2));
+}
+
+.dsh-mdo-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1.5px solid var(--dsw-alias-border-l2, var(--dsw-alias-border-l1));
+  border-radius: 4px;
+  box-sizing: border-box;
+  background: transparent;
+  color: var(--dsw-alias-bg-base);
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.dsh-mdo-check:hover {
+  border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+}
+
+.dsh-mdo-check[data-checked="true"] {
+  border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  background: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+}
+
+/* --- reference card above the composer ----------------------------------- */
+
+.dsh-mdo-refcard {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 6px 0;
+  padding: 7px 10px;
+  box-sizing: border-box;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.dsh-mdo-refcard:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+  border-color: var(--dsw-alias-border-l2, var(--dsw-alias-border-l1));
+}
+
+.dsh-mdo-refcard[data-open="true"] {
+  border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-border-l2));
+}
+
+.dsh-mdo-refcard-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 5px;
+  background: var(--dsw-alias-brand-bg, var(--dsw-alias-bg-layer-2));
+  color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+}
+
+.dsh-mdo-refcard-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-mdo-refcard-count {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--dsw-alias-brand-bg, var(--dsw-alias-bg-layer-2));
+  color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+/* --- selection sidebar --------------------------------------------------- */
+
+.dsh-mdo-side {
+  position: fixed;
+  top: 56px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-base);
+  box-shadow: var(--dsw-alias-shadow-lg, 0 8px 28px rgba(15, 23, 42, 0.16));
+  overflow: hidden;
+  -webkit-app-region: no-drag;
+}
+
+.dsh-mdo-side-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l1);
+}
+
+.dsh-mdo-side-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-mdo-side-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.dsh-mdo-side-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: none;
+  padding: 8px 12px;
+  border-top: 0.5px solid var(--dsw-alias-border-l1);
+}
+
+.dsh-mdo-btn {
+  height: 28px;
+  padding: 0 12px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.dsh-mdo-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+}
+
+.dsh-mdo-btn[data-primary="true"] {
+  border-color: transparent;
+  background: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+  color: var(--dsw-alias-bg-base);
+}
+
+.dsh-mdo-btn[data-primary="true"]:hover {
+  opacity: 0.9;
+}
+
+.dsh-mdo-btn[data-danger="true"] {
+  border-color: var(--dsw-alias-border-l2, var(--dsw-alias-border-l1));
+  color: var(--dsw-alias-label-error, #d14343);
+}
+
+.dsh-mdo-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dsh-mdo-sel-item {
+  margin: 0 0 8px 0;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
+}
+
+.dsh-mdo-sel-item-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.dsh-mdo-sel-item-meta {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-mdo-sel-item-title {
+  margin: 2px 0 0 0;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+  word-break: break-word;
+  user-select: text;
+}
+
+.dsh-mdo-sel-item-body {
+  margin: 6px 0 0 0;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+.dsh-mdo-sel-item-remove {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.dsh-mdo-sel-item-remove:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+  color: var(--dsw-alias-label-primary);
+}
+
+/* --- hidden turns -------------------------------------------------------- */
+
+.dsh-mdo-hidden {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--dsw-alias-border-l1);
+}
+
+.dsh-mdo-hidden-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 3px 6px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dsh-mdo-hidden-toggle:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-mdo-hidden-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-mdo-hidden-row:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+}
+
+.dsh-mdo-hidden-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-mdo-hidden-restore {
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.dsh-mdo-hidden-restore:hover {
+  background: var(--dsw-alias-bg-base);
+  border-color: var(--dsw-alias-border-l2, var(--dsw-alias-border-l1));
+}
+
+.dsh-mdo-hidden-badge {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1));
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.dsh-mdo-hide-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 6px 12px;
+  border-top: 0.5px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-mdo-hide-bar-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.dsh-mdo-confirm {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 80;
+  width: 380px;
+  max-width: calc(100vw - 32px);
+  padding: 16px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-base);
+  box-shadow: var(--dsw-alias-shadow-lg, 0 16px 40px rgba(15, 23, 42, 0.22));
+  -webkit-app-region: no-drag;
+}
+
+.dsh-mdo-confirm-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 79;
+  background: rgba(15, 23, 42, 0.32);
+}
+
+.dsh-mdo-confirm-title {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.dsh-mdo-confirm-text {
+  margin: 0 0 14px 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-mdo-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .dsh-mdo-turn-group + .dsh-mdo-turn-group {
@@ -754,9 +1225,10 @@ window.__ModuleLoader__.load({
         const headings = [];
         for (const block of blocks) {
           if (!block || block.kind !== 'text' || typeof block.text !== 'string') continue;
+          const blockIndex = textBlocks.length;
           textBlocks.push(block.text);
           const parsed = extractBlockHeadings(block.text);
-          for (const item of parsed) headings.push(item);
+          for (const item of parsed) headings.push({ ...item, blockIndex });
         }
 
         if (textBlocks.length > 0) {
@@ -1462,6 +1934,205 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function IconCheck() {
+      return h(
+        'svg',
+        { viewBox: '0 0 12 12', width: 9, height: 9, fill: 'none', 'aria-hidden': 'true' },
+        h('path', {
+          d: 'M2.5 6.2l2.3 2.3L9.5 3.8',
+          stroke: 'currentColor',
+          strokeWidth: '1.8',
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        }),
+      );
+    }
+
+    function IconQuote() {
+      return h(
+        'svg',
+        { viewBox: '0 0 16 16', width: 12, height: 12, fill: 'none', 'aria-hidden': 'true' },
+        h('path', {
+          d: 'M3 4.5h4.5M3 8h6M3 11.5h3.5',
+          stroke: 'currentColor',
+          strokeWidth: '1.5',
+          strokeLinecap: 'round',
+        }),
+        h('path', {
+          d: 'M11 5v6M9.5 9.5L11 11l1.5-1.5',
+          stroke: 'currentColor',
+          strokeWidth: '1.3',
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          opacity: '0.6',
+        }),
+      );
+    }
+
+    function IconEyeOff() {
+      return h(
+        'svg',
+        { viewBox: '0 0 14 14', width: 11, height: 11, fill: 'none', 'aria-hidden': 'true' },
+        h('path', {
+          d: 'M1.6 7S3.7 3.2 7 3.2 12.4 7 12.4 7 10.3 10.8 7 10.8 1.6 7 1.6 7z',
+          stroke: 'currentColor',
+          strokeWidth: '1.2',
+        }),
+        h('circle', { cx: '7', cy: '7', r: '1.7', stroke: 'currentColor', strokeWidth: '1.2' }),
+        h('path', {
+          d: 'M2.4 11.6L11.6 2.4',
+          stroke: 'currentColor',
+          strokeWidth: '1.2',
+          strokeLinecap: 'round',
+        }),
+      );
+    }
+
+    /**
+     * Flatten one turn group's outline rows into display order, carrying the
+     * ancestor heading titles so a reference keeps its section path.
+     * @param {object} group - one built outline group.
+     * @returns {Array<{ item: object, path: string[] }>}
+     */
+    function flattenGroupRows(group) {
+      const rows = [];
+      const walk = (parentId, path) => {
+        for (const item of group.items) {
+          if ((item.parentId ?? null) !== parentId) continue;
+          const nextPath = [...path, item.text];
+          rows.push({ item, path });
+          walk(item.id, nextPath);
+        }
+      };
+      walk(null, []);
+      return rows;
+    }
+
+    /**
+     * Collect the reply text under one heading, from its own line to the next
+     * heading at the same or a shallower depth.
+     * @param {ReadonlyArray<string>} texts - the step's Markdown text blocks.
+     * @param {string} headingText - the heading this section starts at.
+     * @param {number} headingIndex - that heading's ordinal within the step.
+     * @returns {string}
+     */
+    function collectSectionBody(texts, headingText, headingIndex) {
+      const lines = texts.join('\n').split(/\r?\n/);
+      const out = [];
+      let seen = -1;
+      let started = false;
+      let startDepth = 0;
+      let fence = '';
+      for (const line of lines) {
+        const atx = /^ {0,3}(#{1,6})[ \t]+(.*)$/.exec(line);
+        if (atx !== null) {
+          const depth = atx[1].length;
+          const title = atx[2].replace(/[ \t]+#+[ \t]*$/, '').trim();
+          if (!started) {
+            if (title !== headingText) continue;
+            seen += 1;
+            if (seen !== headingIndex) continue;
+            started = true;
+            startDepth = depth;
+            continue;
+          }
+          if (depth <= startDepth) break;
+          out.push(line);
+          continue;
+        }
+        if (started) {
+          const openFence = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+          if (fence === '') {
+            if (openFence !== null) fence = openFence[1][0];
+          } else if (openFence !== null && openFence[1][0] === fence) {
+            fence = '';
+          }
+          out.push(line);
+        }
+      }
+      return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    /**
+     * Assemble one selectable section, with the reply text that follows it.
+     * @param {object} group - the turn group the heading belongs to.
+     * @param {object} item - the heading row.
+     * @param {ReadonlyArray<object>} allSteps - loaded assistant steps.
+     * @param {ReadonlyArray<string>} path - ancestor heading titles, outermost first.
+     * @returns {object} the selection entry.
+     */
+    function buildSectionSelection(group, item, allSteps, path) {
+      const step = (allSteps ?? []).find(
+        (candidate) => candidate.turn === group.turn && candidate.step === item.step,
+      );
+      const text = item.text;
+      let body = '';
+      const blockText = step?.texts?.[item.blockIndex ?? 0];
+      if (typeof blockText === 'string') {
+        body = collectSectionBody(blockText.split('\n'), text, item.indexInStep ?? 0);
+      }
+      return {
+        id: item.id,
+        kind: 'section',
+        turn: group.turn,
+        step: item.step,
+        prompt: group.prompt ?? '',
+        heading: text,
+        path: [...(path ?? [])],
+        depth: item.depth,
+        body,
+      };
+    }
+
+    /**
+     * Render the selected sections as the reference block inserted into the composer.
+     * File references in `@path` form are spelled `@ path` so the composer's
+     * mention trigger does not rewrite them.
+     * @param {ReadonlyArray<object>} entries - selection entries in selection order.
+     * @returns {{ text: string, truncated: boolean }}
+     */
+    function buildReferenceText(entries) {
+      const lines = ['<md-outline-reference>', '参考以下对话片段：', ''];
+      let truncated = false;
+      for (const entry of entries) {
+        const meta = [`第 ${entry.turn} 轮`];
+        if (entry.prompt) meta.push(entry.prompt);
+        lines.push(`## ${entry.heading}`, `（${meta.join(' · ')}）`, '');
+        if (entry.body) {
+          lines.push(entry.body.replace(/(^|\s)@(?=\S)/g, '$1@ '), '');
+        }
+      }
+      lines.push('</md-outline-reference>');
+      let text = lines.join('\n');
+      if (text.length > MAX_REFERENCE_CHARS) {
+        text = `${text.slice(0, MAX_REFERENCE_CHARS)}\n…（内容过长，已截断）\n</md-outline-reference>`;
+        truncated = true;
+      }
+      return { text, truncated };
+    }
+
+    /**
+     * POST one of this plugin's mutating routes.
+     * @param {string} route - route path relative to the page origin.
+     * @param {object} payload - JSON body.
+     * @returns {Promise<{ ok: boolean, body: object }>}
+     */
+    async function postRoute(route, payload) {
+      const resp = await fetch(route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      let body = {};
+      try {
+        body = await resp.json();
+      } catch (error) {
+        // A non-JSON body is reported through the status alone.
+        void error;
+      }
+      return { ok: resp.ok, body };
+    }
+
     const EMPTY_BRIDGE = Object.freeze({
       active: false,
       sessionId: null,
@@ -1470,8 +2141,99 @@ window.__ModuleLoader__.load({
       loadedTurnNums: [],
       allSteps: [],
       groups: [],
+      hiddenTurns: [],
       loadThrough: undefined,
     });
+
+    /**
+     * Cross-slot store for the selection, the reference card, and the Hide
+     * action's confirmation.
+     *
+     * The outline lives in the header slot, the card above the composer, and
+     * the composer itself is reachable only from the dock slot, so neither end
+     * can reach the other through props. This one observable is their shared
+     * owner: the outline writes selections and asks for a confirmation, and the
+     * dock owns the confirmation UI because it is the only place holding both
+     * `inputActions` and the session id the Host routes need.
+     */
+    function createSelectionStore() {
+      let state = { entries: [], selecting: false, sidebarOpen: false, confirmIds: null };
+      const listeners = new Set();
+      const read = () => state;
+      const write = (next) => {
+        if (next === state) return;
+        state = next;
+        for (const fn of listeners) fn();
+      };
+      return {
+        observable: {
+          getSnapshot: read,
+          subscribe: (fn) => {
+            listeners.add(fn);
+            return () => listeners.delete(fn);
+          },
+        },
+        read,
+        setSelecting: (selecting) => write({ ...state, selecting }),
+        setSidebarOpen: (sidebarOpen) => write({ ...state, sidebarOpen }),
+        toggleEntry: (entry) => {
+          const exists = state.entries.some((it) => it.id === entry.id);
+          write({
+            ...state,
+            entries: exists ? state.entries.filter((it) => it.id !== entry.id) : [...state.entries, entry],
+          });
+        },
+        removeEntry: (id) => write({ ...state, entries: state.entries.filter((it) => it.id !== id) }),
+        clearEntries: () => write({ ...state, entries: [], selecting: false }),
+        requestHide: (ids) => write({ ...state, confirmIds: ids }),
+        cancelHide: () => write({ ...state, confirmIds: null }),
+        finishHide: (ids) => write({
+          ...state,
+          confirmIds: null,
+          entries: state.entries.filter((it) => !ids.has(it.id)),
+        }),
+        reset: () => write({ entries: [], selecting: false, sidebarOpen: false, confirmIds: null }),
+      };
+    }
+
+    /** Hidden-turn state per Session, written by the card and read by the outline. */
+    function createHiddenStore() {
+      let state = { bySession: {} };
+      const listeners = new Set();
+      const write = (next) => {
+        state = next;
+        for (const fn of listeners) fn();
+      };
+      return {
+        observable: {
+          getSnapshot: () => state,
+          subscribe: (fn) => {
+            listeners.add(fn);
+            return () => listeners.delete(fn);
+          },
+        },
+        read: () => state,
+        setTurns: (sessionId, turns) => {
+          const current = state.bySession[sessionId];
+          const next = turns.length === 0 ? undefined : turns;
+          if (current === next) return;
+          const bySession = { ...state.bySession };
+          if (next === undefined) delete bySession[sessionId];
+          else bySession[sessionId] = next;
+          write({ bySession });
+        },
+        clear: () => write({ bySession: {} }),
+      };
+    }
+
+    /**
+     * Restore action published by the composer dock, which is the only slot
+     * holding the session id the Host routes need. The outline calls it without
+     * carrying a second copy of the transport, and a missing function simply
+     * leaves the restore buttons disabled.
+     */
+    const restoreActionRef = { current: null };
+
 
     return {
       name: 'md-outline',
@@ -1501,6 +2263,9 @@ window.__ModuleLoader__.load({
             };
           },
         };
+
+        const selectionStore = createSelectionStore();
+        const hiddenStore = createHiddenStore();
 
         function publishBridge(next) {
           bridgeState = next;
@@ -1543,10 +2308,342 @@ window.__ModuleLoader__.load({
           return null;
         }
 
-        /** Left split-column Markdown outline UI mounted in conversation.header.leading. */
+        /**
+         * Reference card above the composer, its detail sidebar, and the
+         * hide/restore actions.
+         *
+         * This slot is the only place with both `inputActions` (to write the
+         * composer) and `sessionId` (to address the Host routes), so the
+         * outline's selections are acted on from here.
+         */
+        function ReferenceDock(props) {
+          const { useSelection, useHiddenTurns, sessionId, inputActions, t } = props;
+          const selection = useSelection((s) => s);
+          const [busy, setBusy] = useState(false);
+          const [notice, setNotice] = useState(null);
+
+          useEffect(() => {
+            if (notice === null) return undefined;
+            const timer = setTimeout(() => setNotice(null), 6000);
+            return () => clearTimeout(timer);
+          }, [notice]);
+
+          useEffect(() => {
+            selectionStore.reset();
+            hiddenStore.clear();
+            return () => {
+              selectionStore.reset();
+            };
+          }, [sessionId]);
+
+          const insertReference = useCallback(() => {
+            const entries = selectionStore.read().entries;
+            if (entries.length === 0) return;
+            const { text } = buildReferenceText(entries);
+            const span = inputActions.captureInsertion();
+            const ok = inputActions.insertText(`${text}\n\n`, span);
+            if (!ok) {
+              setNotice({ text: t('insertFailed') });
+              return;
+            }
+            selectionStore.clearEntries();
+          }, [inputActions, t]);
+
+          const applyHidden = useCallback(async (rawTurns, route) => {
+            if (busy) return;
+            setBusy(true);
+            try {
+              const { ok, body } = await postRoute(route, { sessionId, turns: rawTurns });
+              if (!ok) {
+                const message = typeof body?.message === 'string' ? body.message : 'unexpected failure';
+                setNotice({ text: t(route === HIDE_ROUTE ? 'hideFailed' : 'restoreFailed', { message }) });
+                return;
+              }
+              const current = new Set(hiddenStore.read().bySession[sessionId] ?? []);
+              if (route === HIDE_ROUTE) {
+                for (const turn of rawTurns) current.add(turn);
+              } else {
+                for (const turn of rawTurns) current.delete(turn);
+              }
+              hiddenStore.setTurns(sessionId, [...current].sort((a, b) => a - b));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              setNotice({ text: t(route === HIDE_ROUTE ? 'hideFailed' : 'restoreFailed', { message }) });
+            } finally {
+              setBusy(false);
+            }
+          }, [busy, sessionId, t]);
+
+          // The outline asks for a confirmation through the store; this slot
+          // owns the dialog because only it can reach the composer and routes.
+          useEffect(() => {
+            restoreActionRef.current = async (turns) => {
+              await applyHidden(turns, RESTORE_ROUTE);
+            };
+            return () => {
+              restoreActionRef.current = null;
+            };
+          }, [applyHidden]);          const confirmIds = selection.confirmIds;
+          const selectedTurns = useMemo(() => {
+            if (confirmIds === null) return [];
+            const all = new Set();
+            for (const entry of selection.entries) {
+              if (confirmIds.has(entry.id)) all.add(entry.turn);
+            }
+            return [...all].sort((a, b) => a - b);
+          }, [confirmIds, selection.entries]);
+
+          const card =
+            selection.entries.length === 0
+              ? null
+              : h(
+                  'div',
+                  { className: 'dsh-mdo-refcard-wrap' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-mdo-refcard',
+                      'data-open': selection.sidebarOpen ? 'true' : undefined,
+                      onClick: () => selectionStore.setSidebarOpen(!selection.sidebarOpen),
+                      title: t('openSelection'),
+                    },
+                    h('span', { className: 'dsh-mdo-refcard-icon' }, h(IconQuote)),
+                    h(
+                      'span',
+                      { className: 'dsh-mdo-refcard-text' },
+                      t('selectionBar', { count: selection.entries.length }),
+                    ),
+                    h(
+                      'span',
+                      { className: 'dsh-mdo-refcard-count' },
+                      String(selection.entries.length),
+                    ),
+                  ),
+                );
+
+          const sidebar = selection.sidebarOpen
+            ? h(
+                'aside',
+                {
+                  className: 'dsh-mdo-side',
+                  role: 'dialog',
+                  'aria-label': t('selectionTitle'),
+                },
+                h(
+                  'div',
+                  { className: 'dsh-mdo-side-head' },
+                  h('span', { className: 'dsh-mdo-side-title' }, t('selectionTitle')),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-mdo-sel-item-remove',
+                      title: t('selectionClose'),
+                      'aria-label': t('selectionClose'),
+                      onClick: () => selectionStore.setSidebarOpen(false),
+                    },
+                    h(IconClear),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'dsh-mdo-side-body' },
+                  selection.entries.length === 0
+                    ? h('div', { className: 'dsh-mdo-empty' }, t('selectionEmpty'))
+                    : selection.entries.map((entry) =>
+                        h(
+                          'div',
+                          { key: entry.id, className: 'dsh-mdo-sel-item' },
+                          h(
+                            'div',
+                            { className: 'dsh-mdo-sel-item-head' },
+                            h(
+                              'span',
+                              { className: 'dsh-mdo-sel-item-meta' },
+                              entry.prompt
+                                ? `#${entry.turn} · ${entry.prompt}`
+                                : t('turnLabel', { turn: entry.turn }),
+                            ),
+                            h(
+                              'button',
+                              {
+                                type: 'button',
+                                className: 'dsh-mdo-sel-item-remove',
+                                title: t('clearSelection'),
+                                'aria-label': t('clearSelection'),
+                                onClick: () => selectionStore.removeEntry(entry.id),
+                              },
+                              h(IconClear),
+                            ),
+                          ),
+                          h('div', { className: 'dsh-mdo-sel-item-title' }, entry.heading),
+                          entry.body
+                            ? h('div', { className: 'dsh-mdo-sel-item-body' }, entry.body)
+                            : null,
+                        ),
+                      ),
+                ),
+                h(
+                  'div',
+                  { className: 'dsh-mdo-side-foot' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-mdo-btn',
+                      onClick: () => selectionStore.clearEntries(),
+                    },
+                    t('clearSelection'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-mdo-btn',
+                      'data-primary': 'true',
+                      disabled: selection.entries.length === 0,
+                      onClick: insertReference,
+                    },
+                    t('insertReference'),
+                  ),
+                ),
+              )
+            : null;
+
+          const confirmDialog = confirmIds === null
+            ? null
+            : h(
+                React.Fragment,
+                null,
+                h('div', {
+                  className: 'dsh-mdo-confirm-scrim',
+                  onClick: () => selectionStore.cancelHide(),
+                }),
+                h(
+                  'div',
+                  { className: 'dsh-mdo-confirm', role: 'dialog', 'aria-modal': 'true' },
+                  h(
+                    'div',
+                    { className: 'dsh-mdo-confirm-title' },
+                    t('hideTurns', { count: selectedTurns.length }),
+                  ),
+                  h('p', { className: 'dsh-mdo-confirm-text' }, t('hideTurnsExplain')),
+                  h(
+                    'div',
+                    { className: 'dsh-mdo-confirm-actions' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-mdo-btn',
+                        disabled: busy,
+                        onClick: () => selectionStore.cancelHide(),
+                      },
+                      t('hideCancel'),
+                    ),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-mdo-btn',
+                        'data-danger': 'true',
+                        disabled: busy || selectedTurns.length === 0,
+                        onClick: async () => {
+                          const ids = confirmIds;
+                          selectionStore.finishHide(ids);
+                          await applyHidden(selectedTurns, HIDE_ROUTE);
+                        },
+                      },
+                      busy ? t('hiding') : t('hideConfirm'),
+                    ),
+                  ),
+                ),
+              );
+
+          const noticeLine = notice === null
+            ? null
+            : h(
+                'div',
+                { className: 'dsh-mdo-hide-bar' },
+                h('span', { className: 'dsh-mdo-hide-bar-text' }, notice.text),
+              );
+
+          if (card === null && sidebar === null && confirmDialog === null && noticeLine === null) {
+            return null;
+          }
+
+          return h(
+            React.Fragment,
+            null,
+            card,
+            sidebar,
+            confirmDialog,
+            noticeLine,
+          );
+        }
+
+        /**
+         * Collapsible list of the turns hidden from the model, with a restore
+         * action per turn. It sits under the outline so a hidden turn keeps a
+         * visible address instead of vanishing without trace.
+         */
+        function HiddenTurnsSection(props) {
+          const { t, hiddenTurnNums, hiddenOpen, setHiddenOpen, groups, restoringTurns, onRestore } = props;
+          if (hiddenTurnNums === undefined || hiddenTurnNums.length === 0) return null;
+          const groupByTurn = new Map(groups.map((group) => [group.turn, group]));
+          return h(
+            'div',
+            { className: 'dsh-mdo-hidden' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-mdo-hidden-toggle',
+                'aria-expanded': hiddenOpen,
+                title: hiddenOpen ? t('hiddenHide') : t('hiddenShow'),
+                onClick: () => setHiddenOpen(!hiddenOpen),
+              },
+              h(IconCaret, { collapsed: !hiddenOpen }),
+              h(
+                'span',
+                { className: 'dsh-mdo-turn-text' },
+                t('hiddenTitle', { count: hiddenTurnNums.length }),
+              ),
+            ),
+            hiddenOpen
+              ? hiddenTurnNums.map((turn) => {
+                  const group = groupByTurn.get(turn);
+                  const label = group?.prompt ? `#${turn} · ${group.prompt}` : t('turnLabel', { turn });
+                  const restoring = restoringTurns.has(turn);
+                  return h(
+                    'div',
+                    { key: turn, className: 'dsh-mdo-hidden-row' },
+                    h('span', { className: 'dsh-mdo-hidden-label', title: label }, label),
+                    h('span', { className: 'dsh-mdo-hidden-badge' }, t('hiddenBadge')),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-mdo-hidden-restore',
+                        disabled: restoring,
+                        onClick: () => {
+                          void onRestore([turn]);
+                        },
+                      },
+                      restoring ? t('restoring') : t('restoreTurn'),
+                    ),
+                  );
+                })
+              : null,
+          );
+        }
+
         function OutlineColumnHost(props) {
-          const { useOutlineBridge, t } = props;
+          const { useOutlineBridge, useSelection, useHiddenTurns, t } = props;
           const bridge = useOutlineBridge((s) => s);
+          const selection = useSelection((s) => s);
+          const hiddenState = useHiddenTurns((s) => s);
           const anchorRef = useRef(null);
           const listScrollRef = useRef(null);
           const pointerInsideOutlineRef = useRef(false);
@@ -1569,7 +2666,40 @@ window.__ModuleLoader__.load({
           const [searchQuery, setSearchQuery] = useState('');
           const [remoteBodyHits, setRemoteBodyHits] = useState([]);
           const [searchingRemote, setSearchingRemote] = useState(false);
+          const [hiddenOpen, setHiddenOpen] = useState(false);
+          const [restoringTurns, setRestoringTurns] = useState(() => new Set());
+          const [notice, setNotice] = useState(null);
           const searchInputRef = useRef(null);
+
+          const selecting = selection.selecting;
+          const selectedIds = useMemo(
+            () => new Set(selection.entries.map((it) => it.id)),
+            [selection.entries],
+          );
+          const hiddenTurnNums = hiddenState.bySession[bridge.sessionId] ?? EMPTY_TURNS;
+          const hiddenSet = useMemo(() => new Set(hiddenTurnNums), [hiddenTurnNums]);
+
+          const showNotice = useCallback((text) => {
+            setNotice({ text, at: Date.now() });
+          }, []);
+
+          useEffect(() => {
+            if (notice === null) return undefined;
+            const timer = setTimeout(() => setNotice(null), 6000);
+            return () => clearTimeout(timer);
+          }, [notice]);
+
+          useEffect(() => {
+            if (!selecting) return;
+            const onKey = (e) => {
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                selectionStore.setSelecting(false);
+              }
+            };
+            window.addEventListener('keydown', onKey, true);
+            return () => window.removeEventListener('keydown', onKey, true);
+          }, [selecting]);
 
           const applyJumpRoom = useCallback((rootEl, px) => {
             const next = Math.max(0, Math.ceil(px));
@@ -2267,6 +3397,22 @@ window.__ModuleLoader__.load({
                       h(IconDoubleChevronLeft),
                     ),
                     h('span', { className: 'dsh-mdo-header-title' }, t('title')),
+                    totalHeadings > 0
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-mdo-select-btn',
+                            'data-on': selecting ? 'true' : undefined,
+                            title: selecting ? t('selectModeOn') : t('selectMode'),
+                            'aria-pressed': selecting,
+                            onClick: () => selectionStore.setSelecting(!selecting),
+                          },
+                          selecting
+                            ? t('selectedCount', { count: selection.entries.length })
+                            : t('selectMode'),
+                        )
+                      : null,
                     trimmedQuery !== ''
                       ? h(
                           'span',
@@ -2376,6 +3522,7 @@ window.__ModuleLoader__.load({
                                     const isActive = item.id === activeId;
                                     const isJumping = item.id === jumpingId;
                                     const isFolded = collapsedIds.has(item.id);
+                                    const isChecked = selectedIds.has(item.id);
                                     return h(
                                       'div',
                                       {
@@ -2385,10 +3532,38 @@ window.__ModuleLoader__.load({
                                         'data-active': isActive ? 'true' : undefined,
                                         'data-sub': item.level > 0 ? 'true' : undefined,
                                         'data-jumping': isJumping ? 'true' : undefined,
+                                        'data-checked': isChecked ? 'true' : undefined,
                                         style: {
                                           paddingLeft: `${4 + item.level * 14}px`,
                                         },
                                       },
+                                      selecting
+                                        ? h(
+                                            'button',
+                                            {
+                                              type: 'button',
+                                              className: 'dsh-mdo-check',
+                                              'data-checked': isChecked ? 'true' : undefined,
+                                              'aria-checked': isChecked,
+                                              role: 'checkbox',
+                                              'aria-label': item.text,
+                                              onClick: () => {
+                                                const found = flattenGroupRows(group).find(
+                                                  (row) => row.item.id === item.id,
+                                                );
+                                                selectionStore.toggleEntry(
+                                                  buildSectionSelection(
+                                                    group,
+                                                    item,
+                                                    bridge.allSteps,
+                                                    found?.path ?? [],
+                                                  ),
+                                                );
+                                              },
+                                            },
+                                            isChecked ? h(IconCheck) : null,
+                                          )
+                                        : null,
                                       h(
                                         'span',
                                         { className: 'dsh-mdo-fold-slot' },
@@ -2566,6 +3741,65 @@ window.__ModuleLoader__.load({
                               : null,
                           ),
                   ),
+                  h(HiddenTurnsSection, {
+                    t,
+                    hiddenTurnNums,
+                    hiddenOpen,
+                    setHiddenOpen,
+                    groups: bridge.groups,
+                    restoringTurns,
+                    onRestore: async (turns) => {
+                      const action = restoreActionRef.current;
+                      if (action === null) return;
+                      setRestoringTurns((prev) => {
+                        const next = new Set(prev);
+                        for (const turn of turns) next.add(turn);
+                        return next;
+                      });
+                      try {
+                        await action(turns);
+                      } finally {
+                        setRestoringTurns((prev) => {
+                          const next = new Set(prev);
+                          for (const turn of turns) next.delete(turn);
+                          return next;
+                        });
+                      }
+                    },
+                  }),
+                  notice !== null
+                    ? h(
+                        'div',
+                        { className: 'dsh-mdo-hide-bar' },
+                        h('span', { className: 'dsh-mdo-hide-bar-text' }, notice.text),
+                      )
+                    : null,
+                  selecting
+                    ? h(
+                        'div',
+                        { className: 'dsh-mdo-hide-bar' },
+                        h(
+                          'span',
+                          { className: 'dsh-mdo-hide-bar-text' },
+                          selection.entries.length === 0
+                            ? t('selectMode')
+                            : t('selectedCount', { count: selection.entries.length }),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-mdo-btn',
+                            disabled: selection.entries.length === 0,
+                            onClick: () =>
+                              selectionStore.requestHide(
+                                new Set(selection.entries.map((it) => it.id)),
+                              ),
+                          },
+                          t('hideTurns', { count: selection.entries.length }),
+                        ),
+                      )
+                    : null,
                   h('div', {
                     className: 'dsh-mdo-resizer',
                     role: 'separator',
@@ -2628,10 +3862,30 @@ window.__ModuleLoader__.load({
               inject: () => ({
                 hooks: {
                   outlineBridge: bridgeObservable,
+                  selection: selectionStore.observable,
+                  hiddenTurns: hiddenStore.observable,
                 },
               }),
             },
             OutlineColumnHost,
+          ),
+        );
+
+        ctx.slots.inject('conversation.input.dock', () =>
+          ctx.slots.register(
+            {
+              name: 'conversation.input.dock',
+              id: 'md-outline-reference',
+              order: 30,
+              locale: NS,
+              inject: () => ({
+                hooks: {
+                  selection: selectionStore.observable,
+                  hiddenTurns: hiddenStore.observable,
+                },
+              }),
+            },
+            ReferenceDock,
           ),
         );
       },

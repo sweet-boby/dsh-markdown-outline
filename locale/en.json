@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Markdown Outline",
-    "description": "Displays a collapsible Markdown table of contents column on the left side of the conversation page with heading and full-reply keyword search."
+    "description": "Displays a collapsible Markdown table of contents column on the left side of the conversation page, with heading and full-reply keyword search, multi-select references sent with the next message, and turn hiding."
   }
 }

@@ -11,6 +11,8 @@ A Feishu-style Markdown outline for [DeepSeek Harness](https://github.com/deepse
 - **Heading search.** Matching headings stay in place with their ancestor headings kept as dimmed breadcrumbs, so a hit keeps its section context.
 - **Reply-body search.** Paragraphs, list items, blockquotes, tables and code fences match with a highlighted snippet; reasoning blocks are skipped. Loaded turns are searched in the browser instantly, and earlier unloaded turns are searched on the Host through an authenticated route.
 - **Paragraph-level jump.** A result scrolls to the matching block, not just its section, revealing collapsed ancestors and paging unloaded turns first. The target flashes briefly.
+- **Multi-select references.** Turn on selection, tick any headings, and the picked sections collect into a card above the composer. Clicking the card opens a sidebar with each section's full text; the card inserts them into the draft so they travel with the next message.
+- **Hidden turns.** Select the turns you no longer want the model to see and hide them. Hidden turns disappear from the conversation and from later requests, stay listed under the outline, and can be restored at any time.
 - **Theme-native.** Only `--dsw-alias-*` tokens are used, so the outline follows the light and dark theme without its own palette.
 
 ## Install
@@ -32,24 +34,30 @@ The bundle inserts one row, `md-outline`, into the profile patch. Removing the p
 ## Requirements
 
 - DSH 0.2 or newer, Web or Desktop surface.
-- The Host half registers the `mdOutline` session projection and the `GET /md-outline/search` route. Without the projection registry the panel stays empty; without the route only body search over already-loaded turns is available.
+- The Host half registers the `mdOutline` session projection, the `GET /md-outline/search` route, and the `POST /md-outline/hide` and `POST /md-outline/restore` routes. Without the projection registry the panel stays empty; without the search route only body search over already-loaded turns is available; without the hide routes the selection and reference features still work.
 
 ## How it works
 
 | File | Role |
 |---|---|
-| [`index.js`](index.js) | Host half: the `mdOutline` projection unit folding `turn/start`, `user/message` and `assistant/message` into a per-turn heading outline, plus the authenticated whole-log reply-body search route |
-| [`client.js`](client.js) | Client half: the header bridge that publishes session state, the split-column outline panel, search, and the jump machinery |
+| [`index.js`](index.js) | Host half: the `mdOutline` projection unit folding `turn/start`, `user/message` and `assistant/message` into a per-turn heading outline, the authenticated whole-log reply-body search route, the hidden-turn prompt context, and the hide/restore routes |
+| [`client.js`](client.js) | Client half: the header bridge, the split-column outline panel, search, selection, the reference card and sidebar, the hidden-turn list, and the jump machinery |
 | [`cordis.patch.yml`](cordis.patch.yml) | The profile patch row that mounts the bundle |
 | [`locale/en.json`](locale/en.json), [`locale/zh.json`](locale/zh.json) | Plugin title and description shown by the plugin manager |
 
-The Client half mounts two slots: a session-scoped bridge in `conversation.session.header.actions` that reads the projection, the loaded turns and the paging API, and a root-scoped host in `conversation.header.leading` that renders the column and shifts `[data-conversation-content]` by the panel width.
+The Client half mounts three slots: a session-scoped bridge in `conversation.session.header.actions` that reads the projection, the loaded turns and the paging API; a root-scoped host in `conversation.header.leading` that renders the column and shifts `[data-conversation-content]` by the panel width; and a session-scoped entry in `conversation.input.dock` that renders the reference card, its detail sidebar, and the hide confirmation and owns the composer write.
+
+### Hiding a turn
+
+A hide appends one `user/message` carrying `surfaceOp: { op: 'replace', startSeq, endSeq }` over the selected turns' surface nodes, so the model-visible surface stops carrying them while the event log keeps every original event. The replacement names the hidden turns and tells the model not to reference them. Two ignorable plugin records, `plugin:dsh-markdown-outline/hidden-turn` and `plugin:dsh-markdown-outline/hidden-turn-restored`, form the durable ledger; a runtime prompt context reads that ledger from the live session log on every request, so the model also knows which turns are absent. Restoring writes a ledger entry that drops the turns and appends a short message marking them visible again — the original messages are not replayed into the surface, because DSH cannot reintroduce shadowed events.
 
 ## Limitations
 
 - Headings are recognized in ATX (`#`) and Setext (`===`, `---`) form inside non-reasoning assistant text; headings the model emits inside nested blockquotes or list continuations inherit the reduced heading level the renderer applies, and a heading inside a collapsed details block is not extracted.
 - Body search caps its response at 80 hits per query and reports truncation, so a very common word may leave later matches unreported.
 - The outline column is a fixed split at the left edge; it does not dock into the right sidebar.
+- A reference is inserted as plain text in `<md-outline-reference>` tags; it consumes the draft's insertion point rather than attaching as a structured chip.
+- Hiding needs a live session, so a session must be open in the current page. Restoring marks the turns visible again but cannot replay their messages into the model's history.
 
 ## License
 

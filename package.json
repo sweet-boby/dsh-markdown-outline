@@ -1,7 +1,7 @@
 {
   "name": "dsh-markdown-outline",
-  "version": "1.0.0",
-  "description": "Feishu-style Markdown outline for DSH: a collapsible split-column table of contents on the left of the conversation page, built from the Markdown headings of every AI reply, with heading and full-reply keyword search that also reaches unloaded history.",
+  "version": "1.1.0",
+  "description": "Feishu-style Markdown outline for DSH: a collapsible split-column table of contents on the left of the conversation page, built from the Markdown headings of every AI reply, with heading and full-reply keyword search that also reaches unloaded history, multi-select references sent with the next message, and turn hiding that keeps the log intact.",
   "keywords": [
     "deepseek",
     "harness",

@@ -1,9 +1,20 @@
 /**
  * Host half of dsh-markdown-outline.
+ *
  * Registers the optional `mdOutline` session-projection unit so the Client
  * receives Markdown headings across the entire Session log, including turns
- * outside the currently paged browser event window.
+ * outside the currently paged browser event window. It also owns the routes
+ * that change what the model sees: hiding whole turns from the model-visible
+ * surface, and restoring them.
+ *
+ * A hide is an append-only surface replacement, never a log edit: the selected
+ * turns are shadowed by one user message recording what was removed, so the
+ * transcript stays replayable and the same range can be unhidden later. The
+ * durable ledger of hides is this plugin's own ignorable records, read back on
+ * every observation and carried into each request as one prompt context.
  */
+
+import { appendPluginRecord } from '@deepseek-ai/dsh-session';
 
 const PROMPT_PREVIEW_LIMIT = 60;
 const HEADING_TEXT_LIMIT = 140;
@@ -356,6 +367,8 @@ const mdOutlineProjectionDefinition = {
 };
 
 const SEARCH_ROUTE_PATH = '/md-outline/search';
+const HIDE_ROUTE_PATH = '/md-outline/hide';
+const RESTORE_ROUTE_PATH = '/md-outline/restore';
 const MAX_BODY_HITS = 80;
 const SNIPPET_RADIUS = 36;
 
@@ -627,6 +640,220 @@ function searchSessionAssistantEvents(events, rawQuery) {
   return { hits, truncated };
 }
 
+// ---------------------------------------------------------------------------
+// Turn hiding.
+//
+// A hide replaces the surface range covering selected turns with one user
+// message that records what went out, so the request stops carrying them. The
+// log itself is untouched, which is what lets the same range be restored.
+// ---------------------------------------------------------------------------
+
+/** This plugin's own durable record types, under its package name. */
+const HIDE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn';
+const RESTORE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn-restored';
+
+/** Prompt-context name and placement for the running hidden-turn ledger. */
+const HIDDEN_CONTEXT_NAME = 'md-outline:hidden-turns';
+const HIDDEN_CONTEXT_ORDER = 115.5;
+
+/** Body ceiling for the two mutating routes; both take small JSON objects. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+/** Longest reference body accepted in one request, in characters. */
+const MAX_REFERENCE_CHARS = 120_000;
+
+/**
+ * Read a bounded request body as UTF-8 text.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {Promise<string | null>} the body, or null past {@link MAX_BODY_BYTES}.
+ */
+async function readBoundedBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      req.resume();
+      return null;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size).toString('utf8');
+}
+
+/**
+ * Parse a request body as a JSON object.
+ * @param {string} text
+ * @returns {Record<string, unknown> | null}
+ */
+function parseJsonObject(text) {
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (error) {
+    // A non-JSON body is exactly the null case; nothing else can be reported.
+    void error;
+    return null;
+  }
+  return typeof body === 'object' && body !== null && !Array.isArray(body) ? body : null;
+}
+
+/**
+ * Read this plugin's hide ledger from one event log.
+ *
+ * Each hide adds its turn numbers and the surface seqs it shadowed; a restore
+ * removes them again. The result therefore describes the current model-visible
+ * hiding exactly, including after a reload.
+ * @param {ReadonlyArray<any>} events
+ * @returns {{ turns: Map<number, { turn: number, hideSeq: number, seqs: number[] }>, bySeq: Map<number, number>, seq: number }}
+ *   hidden turns by number, the turn that owns each shadowed seq, and the last ledger seq.
+ */
+function foldHiddenTurns(events) {
+  const turns = new Map();
+  const bySeq = new Map();
+  let lastSeq = -1;
+
+  const unlink = (turn) => {
+    const entry = turns.get(turn);
+    if (entry === undefined) return;
+    for (const seq of entry.seqs) bySeq.delete(seq);
+    turns.delete(turn);
+  };
+
+  for (const event of events) {
+    if (event?.type !== HIDE_RECORD && event?.type !== RESTORE_RECORD) continue;
+    if (event.ignorable !== true) continue;
+    const data = event.data;
+    if (typeof data !== 'object' || data === null) continue;
+    if (!Array.isArray(data.turns)) continue;
+    lastSeq = Math.max(lastSeq, event.seq);
+    if (event.type === HIDE_RECORD) {
+      for (const item of data.turns) {
+        if (typeof item?.turn !== 'number' || !Array.isArray(item.seqs)) continue;
+        unlink(item.turn);
+        const seqs = item.seqs.filter((seq) => typeof seq === 'number');
+        for (const seq of seqs) bySeq.set(seq, item.turn);
+        turns.set(item.turn, { turn: item.turn, hideSeq: event.seq, seqs });
+      }
+    } else {
+      for (const turn of data.turns) {
+        if (typeof turn === 'number') unlink(turn);
+      }
+    }
+  }
+
+  return { turns, bySeq, seq: lastSeq };
+}
+
+/**
+ * Collect the surface seqs belonging to selected turns.
+ *
+ * A turn owns every surface node at or after its `turn/start` and before the
+ * next turn boundary, so the caller can shadow a contiguous range without
+ * slicing a turn in half.
+ * @param {ReadonlyArray<any>} events
+ * @param {ReadonlySet<number>} selectedTurns
+ * @returns {{ seqs: number[], turns: number[], byTurn: Array<{ turn: number, seqs: number[] }> }}
+ *   shadowable seqs in log order, the turn numbers actually covered, and the seqs each owns.
+ */
+function surfaceSeqsOfTurns(events, selectedTurns) {
+  const surfaceTypes = new Set([
+    'system/message',
+    'developer/message',
+    'user/message',
+    'assistant/message',
+    'tool/result',
+  ]);
+  let currentTurn = null;
+  const seqs = [];
+  const owned = new Map();
+
+  for (const event of events) {
+    if (event?.type === 'turn/start') {
+      const turn = event.data?.turn;
+      currentTurn = typeof turn === 'number' ? turn : null;
+      continue;
+    }
+    if (currentTurn === null || !selectedTurns.has(currentTurn)) continue;
+    if (!surfaceTypes.has(event.type) || event.surfaceOp === undefined) continue;
+    seqs.push(event.seq);
+    const list = owned.get(currentTurn);
+    if (list === undefined) owned.set(currentTurn, [event.seq]);
+    else list.push(event.seq);
+  }
+
+  const turns = [...owned.keys()].sort((a, b) => a - b);
+  return { seqs, turns, byTurn: turns.map((turn) => ({ turn, seqs: owned.get(turn) })) };
+}
+
+/**
+ * Render the hidden-turn ledger as the runtime context the model reads.
+ * @param {ReturnType<typeof foldHiddenTurns>} ledger
+ * @returns {string} the context text, or '' when nothing is hidden.
+ */
+function renderHiddenContext(ledger) {
+  if (ledger.turns.size === 0) return '';
+  const turns = [...ledger.turns.keys()].sort((a, b) => a - b);
+  return [
+    '## Hidden conversation turns',
+    '',
+    'The user hid the following turns from this conversation. Their messages are absent from the history above, and the model cannot read them.',
+    `Hidden turn numbers: ${turns.join(', ')}.`,
+    'Do not claim to remember them, and do not ask the user to repeat them unless the current request depends on what they contained.',
+  ].join('\n');
+}
+
+/**
+ * Build the user message that replaces a hidden range.
+ * @param {readonly number[]} turns - hidden turn numbers.
+ * @param {number} shadowedCount - how many surface nodes the replacement shadows.
+ * @returns {object} a user message for `session.append`.
+ */
+function buildHideMessage(turns, shadowedCount) {
+  return {
+    id: `md-outline-hidden-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    role: 'user',
+    content: [{
+      type: 'text',
+      text: [
+        `<hidden-turns count="${turns.length}" shadowed="${shadowedCount}">`,
+        `The user hid turn${turns.length === 1 ? '' : 's'} ${turns.join(', ')} from this conversation.`,
+        'Those messages are no longer part of the history and must not be referenced, quoted, or summarized.',
+        '</hidden-turns>',
+      ].join('\n'),
+    }],
+    source: { kind: 'hidden-turns', plugin: 'dsh-markdown-outline', turns: [...turns] },
+  };
+}
+
+/**
+ * Build the bridge message that marks a restored range as visible again.
+ * @param {readonly number[]} turns - restored turn numbers.
+ * @returns {object} a user message for `session.append`.
+ */
+function buildRestoreMessage(turns) {
+  return {
+    id: `md-outline-restored-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    role: 'user',
+    content: [{
+      type: 'text',
+      text: [
+        `<restored-turns count="${turns.length}">`,
+        `The user restored turn${turns.length === 1 ? '' : 's'} ${turns.join(', ')}.`,
+        'Earlier hidden-turn records no longer apply to them.',
+        '</restored-turns>',
+      ].join('\n'),
+    }],
+    source: { kind: 'hidden-turns', plugin: 'dsh-markdown-outline', turns: [...turns] },
+  };
+}
+
+/**
+ * Send a JSON response.
+ * @param {import('node:http').ServerResponse} res
+ * @param {number} status
+ * @param {unknown} payload
+ */
 function sendJson(res, status, payload) {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -635,13 +862,193 @@ function sendJson(res, status, payload) {
 }
 
 /**
- * Mount the Host-side session projection unit and whole-session body search route.
+ * Mount the Host-side session projection unit, the whole-session body search
+ * route, the hidden-turn context provider, and the two routes that hide and
+ * restore turns.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
   ctx.inject(['sessionProjections'], (scope) => {
     scope.sessionProjections.register(mdOutlineProjectionDefinition);
   });
+
+  // The hidden-turn ledger is a runtime context. DSH prompt providers are
+  // synchronous, so fold the live session log into a small per-session cache
+  // and invalidate it when this plugin appends a hide or restore record.
+  ctx.inject(['systemPrompt'], (scope) => {
+    /** Per-session ledger cache; a WeakMap follows the live Session lifetime. */
+    const hiddenBySession = new WeakMap();
+
+    const ledgerOf = (session) => {
+      const cached = hiddenBySession.get(session);
+      if (cached !== undefined && cached.throughSeq >= session.seq - 1) return cached.ledger;
+      const ledger = foldHiddenTurns(session.snapshotEvents());
+      hiddenBySession.set(session, { throughSeq: session.seq - 1, ledger });
+      return ledger;
+    };
+
+    scope.on('session/event', (session, event) => {
+      if (event.type === HIDE_RECORD || event.type === RESTORE_RECORD) {
+        hiddenBySession.delete(session);
+      }
+    });
+
+    scope.systemPrompt.context({
+      name: HIDDEN_CONTEXT_NAME,
+      order: HIDDEN_CONTEXT_ORDER,
+      interpolate: false,
+      text: ({ agent }) => agent === undefined ? '' : renderHiddenContext(ledgerOf(agent.session)),
+    });
+  });
+
+  ctx.inject(['webServer', 'connection', 'sessions', 'sessionQuery'], (scope) => {
+    const reject = (req, res) => {
+      const rejection = scope.connection.requestRejection(req);
+      if (rejection === undefined) return false;
+      res.statusCode = rejection;
+      res.end();
+      return true;
+    };
+
+    const readBody = async (req, res) => {
+      if (req.method !== 'POST') {
+        res.statusCode = 405;
+        res.setHeader('allow', 'POST');
+        res.end();
+        return null;
+      }
+      const essence = String(req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
+      if (essence !== 'application/json') {
+        sendJson(res, 415, { code: 'unsupported-media-type', message: 'content-type must be application/json' });
+        return null;
+      }
+      let text;
+      try {
+        text = await readBoundedBody(req);
+      } catch (error) {
+        // The socket failed mid-body, so there is nothing left to validate.
+        void error;
+        sendJson(res, 400, { code: 'bad-request', message: 'request body unreadable' });
+        return null;
+      }
+      if (text === null) {
+        sendJson(res, 413, { code: 'payload-too-large', message: 'request body is too large' });
+        return null;
+      }
+      const body = parseJsonObject(text);
+      if (body === null) {
+        sendJson(res, 400, { code: 'bad-request', message: 'request body must be a JSON object' });
+        return null;
+      }
+      if (typeof body.sessionId !== 'string' || body.sessionId.trim() === '') {
+        sendJson(res, 400, { code: 'bad-request', message: 'sessionId is required' });
+        return null;
+      }
+      return { sessionId: body.sessionId.trim(), body };
+    };
+
+    const integerList = (value) =>
+      Array.isArray(value)
+        ? [...new Set(value.filter((item) => typeof item === 'number' && Number.isInteger(item)))]
+        : [];
+
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
+        path: HIDE_ROUTE_PATH,
+        handler: async (req, res) => {
+          if (reject(req, res)) return;
+          const parsed = await readBody(req, res);
+          if (parsed === null) return;
+          const turns = integerList(parsed.body.turns);
+          if (turns.length === 0) {
+            sendJson(res, 400, { code: 'bad-request', message: 'turns must be a non-empty array of integers' });
+            return;
+          }
+          // Only a live session can append; the client always has the session
+          // open when it hides, so a miss is a stale request rather than a state
+          // to compensate for.
+          const session = scope.sessions.get(parsed.sessionId);
+          if (session === undefined) {
+            sendJson(res, 409, { code: 'session-not-live', message: 'open the session before hiding turns' });
+            return;
+          }
+          let picked;
+          let observation;
+          try {
+            observation = await scope.sessionQuery.observeSession(parsed.sessionId, {
+              projectionMode: 'none',
+            });
+            picked = surfaceSeqsOfTurns(observation.events, new Set(turns));
+          } finally {
+            if (observation && typeof observation[Symbol.dispose] === 'function') {
+              observation[Symbol.dispose]();
+            }
+          }
+          if (picked.turns.length === 0) {
+            sendJson(res, 409, { code: 'nothing-to-hide', message: 'the selected turns carry no model-visible content' });
+            return;
+          }
+          try {
+            session.append('user/message', buildHideMessage(picked.turns, picked.seqs.length), {
+              surfaceOp: { op: 'replace', startSeq: picked.seqs[0], endSeq: picked.seqs[picked.seqs.length - 1] },
+              sourceEventSeqs: picked.seqs,
+            });
+            appendPluginRecord(session, HIDE_RECORD, {
+              turns: picked.byTurn,
+              hiddenAt: Date.now(),
+              shadowedStart: picked.seqs[0],
+              shadowedEnd: picked.seqs[picked.seqs.length - 1],
+            });
+          } catch (error) {
+            sendJson(res, 500, {
+              code: 'hide-failed',
+              message: error instanceof Error ? error.message : 'hiding failed',
+            });
+            return;
+          }
+          sendJson(res, 200, { hidden: picked.turns });
+        },
+      }),
+    );
+
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
+        path: RESTORE_ROUTE_PATH,
+        handler: async (req, res) => {
+          if (reject(req, res)) return;
+          const parsed = await readBody(req, res);
+          if (parsed === null) return;
+          const turns = integerList(parsed.body.turns);
+          if (turns.length === 0) {
+            sendJson(res, 400, { code: 'bad-request', message: 'turns must be a non-empty array of integers' });
+            return;
+          }
+          const session = scope.sessions.get(parsed.sessionId);
+          if (session === undefined) {
+            sendJson(res, 409, { code: 'session-not-live', message: 'open the session before restoring turns' });
+            return;
+          }
+          try {
+            appendPluginRecord(session, RESTORE_RECORD, { turns, restoredAt: Date.now() });
+            session.append('user/message', buildRestoreMessage(turns), {
+              surfaceOp: 'append',
+            });
+          } catch (error) {
+            sendJson(res, 500, {
+              code: 'restore-failed',
+              message: error instanceof Error ? error.message : 'restoring failed',
+            });
+            return;
+          }
+          sendJson(res, 200, { restored: turns });
+        },
+      }),
+    );
+  });
+
+
 
   ctx.inject(['webServer', 'connection', 'sessionQuery'], (scope) => {
     scope.effect(() =>
