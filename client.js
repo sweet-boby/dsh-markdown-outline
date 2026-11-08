@@ -32,7 +32,6 @@ window.__ModuleLoader__.load({
     const SEARCH_ROUTE = 'md-outline/search';
     const HIDE_ROUTE = 'md-outline/hide';
     const RESTORE_ROUTE = 'md-outline/restore';
-    const SET_REFERENCE_ROUTE = 'md-outline/reference';
     const DEFAULT_WIDTH = 252;
     const MIN_WIDTH = 180;
     const MAX_WIDTH = 420;
@@ -86,7 +85,6 @@ window.__ModuleLoader__.load({
       hiding: 'Hiding…',
       hideFailed: 'Could not hide turns: {message}',
       restoreFailed: 'Could not restore the turn: {message}',
-      attachFailed: 'Could not attach the reference',
       hiddenBadge: 'hidden',
     };
 
@@ -132,7 +130,6 @@ window.__ModuleLoader__.load({
       hiding: '正在隐藏…',
       hideFailed: '隐藏失败：{message}',
       restoreFailed: '恢复失败：{message}',
-      attachFailed: '附加引用失败',
       hiddenBadge: '已隐藏',
     };
 
@@ -2174,23 +2171,37 @@ window.__ModuleLoader__.load({
      * @returns {{ text: string, truncated: boolean }}
      */
     function buildReferenceText(entries) {
-      const lines = ['<md-outline-reference>', '参考以下对话片段：', ''];
-      let truncated = false;
-      for (const entry of entries) {
+      // This text lands in the composer, so it reads as a compact citation
+      // rather than a Markdown document: the reader can still see and edit it,
+      // and the model receives the same content it always did.
+      const blocks = entries.map((entry) => {
         const meta = [`第 ${entry.turn} 轮`];
         if (entry.prompt) meta.push(entry.prompt);
-        lines.push(`## ${entry.heading}`, `（${meta.join(' · ')}）`, '');
-        if (entry.body) {
-          lines.push(entry.body.replace(/(^|\s)@(?=\S)/g, '$1@ '), '');
-        }
-      }
-      lines.push('</md-outline-reference>');
-      let text = lines.join('\n');
+        const head = `【引用】${entry.heading}（${meta.join(' · ')}）`;
+        const body = entry.body
+          ? entry.body.replace(/(^|\s)@(?=\S)/g, '$1@ ').trim()
+          : '';
+        return body === '' ? head : `${head}\n${body}`;
+      });
+
+      let text = `<md-outline-reference>\n${blocks.join('\n\n')}\n</md-outline-reference>`;
+      let truncated = false;
       if (text.length > MAX_REFERENCE_CHARS) {
         text = `${text.slice(0, MAX_REFERENCE_CHARS)}\n…（内容过长，已截断）\n</md-outline-reference>`;
         truncated = true;
       }
       return { text, truncated };
+    }
+
+    /**
+     * Remove every reference block from a draft.
+     * @param {string} draft - composer text.
+     * @returns {string} the draft without reference blocks.
+     */
+    function stripReferenceBlocks(draft) {
+      return String(draft)
+        .replace(/<md-outline-reference>[\s\S]*?<\/md-outline-reference>\n*/g, '')
+        .trim();
     }
 
     /**
@@ -2459,16 +2470,16 @@ window.__ModuleLoader__.load({
          * calls from here: a reference attachment, or a hide/restore.
          */
         function ReferenceDock(props) {
-          const { useSelection, useHiddenTurns, sessionId, t } = props;
+          const { useSelection, useHiddenTurns, sessionId, inputActions, useInput, t } = props;
           const selection = useSelection((s) => s);
+          const liveDraft = useInput((s) => s.draft);
           const [busy, setBusy] = useState(false);
           const [notice, setNotice] = useState(null);
-          /**
-           * The reference text already handed to the Host. `null` means this
-           * mount has said nothing yet: an empty attachment then stays silent,
-           * while the first real change always reaches the Host.
-           */
+          /** The reference block currently written into the draft. */
           const lastAttachedRef = useRef(null);
+          /** The composer text, kept current so the effect never writes stale content. */
+          const draftRef = useRef(liveDraft);
+          draftRef.current = liveDraft;
 
           useEffect(() => {
             if (notice === null) return undefined;
@@ -2484,26 +2495,25 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId]);
 
-          // Only a confirmed attachment reaches the Host. The composer stays
-          // plain text, and ticking more headings afterwards changes nothing
-          // about what will be sent until the reader confirms again.
+          // The confirmed reference lives in the draft, because that is the only
+          // place a message picks up content from: a record on the Host is read
+          // after the turn has already claimed its messages. Confirming writes
+          // the block, detaching removes it, and whatever the reader typed
+          // around it stays untouched.
           useEffect(() => {
             const entries = selection.attached;
             const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
             if (next === lastAttachedRef.current) return;
-            if (next === '' && lastAttachedRef.current === null) {
-              // Nothing attached at mount: there is nothing to detach yet.
-              lastAttachedRef.current = '';
-              return;
-            }
             lastAttachedRef.current = next;
-            void postRoute(SET_REFERENCE_ROUTE, { sessionId, text: next }).catch(() => {
-              // A failed attach is reported once; the card still shows what the
-              // reader confirmed, so the next confirmation retries.
-              lastAttachedRef.current = null;
-              setNotice({ text: t('attachFailed') });
-            });
-          }, [selection.attached, sessionId, t]);
+
+            const current = draftRef.current;
+            const withoutBlock = stripReferenceBlocks(current);
+            const merged = next === '' ? withoutBlock : (withoutBlock === '' ? next : `${next}\n\n${withoutBlock}`);
+            // Mount with nothing attached must not touch the composer.
+            if (merged === current) return;
+            draftRef.current = merged;
+            inputActions.setDraft(merged);
+          }, [selection.attached, inputActions]);
 
           const applyHidden = useCallback(async (rawTurns, route) => {
             if (busy) return;

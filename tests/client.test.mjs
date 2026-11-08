@@ -182,77 +182,19 @@ test('the hiding rule survives the outline unmounting', () => {
   assert.ok(outline !== undefined)
 })
 
+
 /**
- * Render the composer dock with recording Host routes.
- * @param {{ entries?: object[], attached?: object[] }} options - live tick list and confirmed attachment.
- * @returns {{ posts: object[], writes: string[] }} recorded Host calls.
+ * Render the composer dock with a live draft.
+ * @param {{ attached?: object[], draft?: string }} options - confirmed reference and starting draft.
+ * @returns {{ draft: () => string, writes: string[] }} the draft and the writes made.
  */
-function renderDock({ entries = [], attached = [] }) {
+function renderDock({ attached = [], draft = '' } = {}) {
   const client = loadClient()
   const dock = client.registered.get('md-outline-reference')
   assert.ok(dock !== undefined, 'the composer dock must be registered')
 
-  const posts = []
+  let current = draft
   const writes = []
-  client.setFetch(async (url, init) => {
-    posts.push({ url, body: JSON.parse(init.body) })
-    return { ok: true, json: async () => ({ attached: true }) }
-  })
-
-  dock({
-    useSelection: (selector) => selector({
-      entries,
-      attached,
-      selecting: entries.length > 0,
-      sidebarOpen: false,
-      confirmIds: null,
-    }),
-    useHiddenTurns: (selector) => selector({ bySession: {} }),
-    sessionId: 'session-1',
-    t: (key, params) => (params === undefined ? key : `${key}:${JSON.stringify(params)}`),
-  })
-
-  const attach = posts.filter((post) => post.url.includes('md-outline/reference')).at(-1)
-  return { posts, writes, attach }
-}
-
-const ENTRY = {
-  id: 't22:s1:h0',
-  turn: 22,
-  step: 1,
-  prompt: 'fix the search',
-  heading: 'First layer: Chinese tokenization',
-  body: 'Merging results goes through the Go service.\n\n```text\n/articles/search?keyword=水泥\n```',
-  path: [],
-}
-
-test('an unconfirmed selection never reaches the Host', () => {
-  const { attach, writes } = renderDock({ entries: [ENTRY] })
-  assert.equal(attach, undefined, 'ticking alone must not attach anything')
-  assert.equal(writes.length, 0, 'the composer must stay plain text')
-})
-
-test('a confirmed attachment travels with the next message', () => {
-  const { attach, writes } = renderDock({ attached: [ENTRY] })
-  assert.ok(attach !== undefined, 'the confirmed reference is posted')
-  assert.equal(attach.body.sessionId, 'session-1')
-  assert.match(attach.body.text, /First layer: Chinese tokenization/)
-  assert.match(attach.body.text, /Merging results goes through the Go service/)
-  assert.match(attach.body.text, /第 22 轮/)
-  assert.equal(writes.length, 0, 'the composer must stay plain text')
-})
-
-test('detaching posts an empty body so the Host forgets the reference', () => {
-  const client = loadClient()
-  const dock = client.registered.get('md-outline-reference')
-  const posts = []
-  client.setFetch(async (url, init) => {
-    posts.push({ url, body: JSON.parse(init.body) })
-    return { ok: true, json: async () => ({}) }
-  })
-
-  // Drive one dock through attach then detach, the way the reader does it.
-  let attached = [ENTRY]
   const render = () => dock({
     useSelection: (selector) => selector({
       entries: [],
@@ -262,40 +204,91 @@ test('detaching posts an empty body so the Host forgets the reference', () => {
       confirmIds: null,
     }),
     useHiddenTurns: (selector) => selector({ bySession: {} }),
+    useInput: (selector) => selector({ draft: current, phase: 'plain' }),
     sessionId: 'session-1',
+    inputActions: {
+      captureInsertion: () => ({ draftRev: 0 }),
+      insertText: () => true,
+      setDraft: (text) => {
+        writes.push(text)
+        current = text
+      },
+      persistDraft: () => {},
+    },
     t: (key) => key,
   })
 
   render()
-  const attachedPosts = posts.filter((post) => post.url.includes('reference'))
-  assert.equal(attachedPosts.length, 1, 'the confirmed attachment is posted once')
-  assert.match(attachedPosts[0].body.text, /First layer/)
+  return { draft: () => current, writes, render, client }
+}
 
-  // Detach within the same mount: the composer card goes away and the Host is
-  // told to forget the reference.
-  attached = []
-  client.__render()
-  render()
-  const detachPost = posts.filter((post) => post.url.includes('reference')).at(-1)
-  assert.equal(detachPost.body.text, '', 'detaching posts an empty body')
+const ENTRY = {
+  id: 't22:s1:h0',
+  turn: 22,
+  step: 1,
+  prompt: 'fix the search',
+  heading: '第一层：中文连接词规范化',
+  body: '/articles/search?keyword=水泥和水果',
+  path: [],
+}
+
+test('confirming a reference writes it into the draft', () => {
+  const { draft, writes } = renderDock({ attached: [ENTRY] })
+
+  assert.equal(writes.length, 1, 'the reference is written once')
+  assert.match(draft(), /<md-outline-reference>/)
+  assert.match(draft(), /第一层：中文连接词规范化/)
+  assert.match(draft(), /第 22 轮/)
+  assert.match(draft(), /\/articles\/search\?keyword=水泥和水果/)
 })
 
-test('the confirm gate keeps ticking separate from what will be sent', () => {
-  const { internals } = loadClient()
-  const store = internals.createSelectionStore()
+test('the reference keeps the words the reader already typed', () => {
+  const { draft } = renderDock({ attached: [ENTRY], draft: '我发给了你啥' })
 
-  store.toggleEntry({ id: 'a', turn: 1, heading: 'A', body: '' })
-  store.setSelecting(true)
-  assert.equal(store.read().attached.length, 0, 'ticking alone attaches nothing')
+  assert.match(draft(), /<md-outline-reference>/, 'the block is present')
+  assert.match(draft(), /我发给了你啥/, 'the typed text survives')
+  assert.ok(
+    draft().indexOf('</md-outline-reference>') < draft().indexOf('我发给了你啥'),
+    'the reference sits above the typed text',
+  )
+})
 
-  store.attachEntries()
-  assert.equal(store.read().attached.length, 1, 'confirming attaches the ticked entry')
-  assert.equal(store.read().attached[0].id, 'a')
-  assert.equal(store.read().selecting, false, 'confirming leaves selection mode')
+test('an empty attachment leaves the draft alone', () => {
+  const { draft, writes } = renderDock({ attached: [], draft: '只是说话' })
+  assert.equal(writes.length, 0, 'nothing to write without an attachment')
+  assert.equal(draft(), '只是说话')
+})
 
-  store.toggleEntry({ id: 'b', turn: 2, heading: 'B', body: '' })
-  assert.equal(store.read().attached.length, 1, 'ticking afterwards leaves the attachment alone')
+test('detaching removes the block and keeps the typed text', () => {
+  const first = renderDock({ attached: [ENTRY], draft: '我发给了你啥' })
+  assert.match(first.draft(), /<md-outline-reference>/)
 
-  store.detach()
-  assert.equal(store.read().attached.length, 0, 'detaching clears the attachment')
+  // Detach in the same mount: the card goes and the block leaves the draft.
+  const second = loadClient()
+  const dock = second.registered.get('md-outline-reference')
+  let current = first.draft()
+  dock({
+    useSelection: (selector) => selector({
+      entries: [],
+      attached: [],
+      selecting: false,
+      sidebarOpen: false,
+      confirmIds: null,
+    }),
+    useHiddenTurns: (selector) => selector({ bySession: {} }),
+    useInput: (selector) => selector({ draft: current, phase: 'plain' }),
+    sessionId: 'session-1',
+    inputActions: {
+      captureInsertion: () => ({ draftRev: 0 }),
+      insertText: () => true,
+      setDraft: (text) => {
+        current = text
+      },
+      persistDraft: () => {},
+    },
+    t: (key) => key,
+  })
+
+  assert.ok(!current.includes('<md-outline-reference>'), 'the block is gone')
+  assert.match(current, /我发给了你啥/, 'the typed text stays')
 })
