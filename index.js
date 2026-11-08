@@ -222,10 +222,22 @@ function assertValidTurnEntry(turnEntry) {
   }
 }
 
+/** Turn numbers the user hid; the client filters these out of both the outline and the transcript. */
+function assertValidHiddenTurns(list) {
+  if (!Array.isArray(list)) throw new Error('mdOutline hiddenTurns must be an array');
+  for (const turn of list) {
+    if (typeof turn !== 'number' || !Number.isInteger(turn) || turn < 0) {
+      throw new Error('mdOutline hiddenTurns must hold non-negative integers');
+    }
+  }
+}
+
 const viewSchema = {
   parse(val) {
-    if (!Array.isArray(val)) throw new Error('mdOutline view must be an array');
-    for (const item of val) assertValidTurnEntry(item);
+    if (typeof val !== 'object' || val === null) throw new Error('mdOutline view must be an object');
+    if (!Array.isArray(val.turns)) throw new Error('mdOutline view requires a turns array');
+    for (const item of val.turns) assertValidTurnEntry(item);
+    assertValidHiddenTurns(val.hiddenTurns ?? []);
     return val;
   },
 };
@@ -240,14 +252,25 @@ const stateSchema = {
     }
     for (const item of val.allTurns) assertValidTurnEntry(item);
     for (const item of val.visibleTurns) assertValidTurnEntry(item);
+    assertValidHiddenTurns(val.hiddenTurns ?? []);
     return val;
   },
 };
+
+/** This plugin's own durable record types, under its package name. */
+const HIDE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn';
+const RESTORE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn-restored';
+
+/**
+ * The record names the projection folds, so hiding takes effect in the UI the
+ * same way it takes effect for the model.
+ */
 
 const EMPTY_TURNS = Object.freeze([]);
 const EMPTY_STATE = Object.freeze({
   allTurns: EMPTY_TURNS,
   visibleTurns: EMPTY_TURNS,
+  hiddenTurns: EMPTY_TURNS,
 });
 
 function countTotalHeadings(turns) {
@@ -271,11 +294,11 @@ const mdOutlineProjectionDefinition = {
         const last = state.allTurns.at(-1);
         if (last !== undefined && turnNum <= last.turn) return state;
         return {
+          ...state,
           allTurns: [
             ...state.allTurns,
             { turn: turnNum, seq: event.seq, prompt: '', steps: [] },
           ],
-          visibleTurns: state.visibleTurns,
         };
       }
       case 'user/message': {
@@ -287,12 +310,12 @@ const mdOutlineProjectionDefinition = {
         const updatedTurn = { ...last, prompt };
         const nextAll = [...state.allTurns.slice(0, -1), updatedTurn];
         if (last.steps.length === 0) {
-          return { allTurns: nextAll, visibleTurns: state.visibleTurns };
+          return { ...state, allTurns: nextAll };
         }
         const nextVisible = state.visibleTurns.map((t) =>
           t.turn === updatedTurn.turn ? updatedTurn : t,
         );
-        return { allTurns: nextAll, visibleTurns: nextVisible };
+        return { ...state, allTurns: nextAll, visibleTurns: nextVisible };
       }
       case 'assistant/message': {
         const turnNum = event.data?.turn;
@@ -352,9 +375,26 @@ const mdOutlineProjectionDefinition = {
 
         const nextVisible = nextAll.filter((t) => t.steps.length > 0);
         if (nextVisible.length === 0 && state.visibleTurns.length === 0) {
-          return { allTurns: nextAll, visibleTurns: state.visibleTurns };
+          return { ...state, allTurns: nextAll };
         }
-        return { allTurns: nextAll, visibleTurns: nextVisible };
+        return { ...state, allTurns: nextAll, visibleTurns: nextVisible };
+      }
+      case HIDE_RECORD: {
+        const items = Array.isArray(event.data?.turns) ? event.data.turns : [];
+        const added = items
+          .map((item) => item?.turn)
+          .filter((turn) => typeof turn === 'number' && Number.isInteger(turn));
+        if (added.length === 0) return state;
+        const next = new Set(state.hiddenTurns);
+        for (const turn of added) next.add(turn);
+        return { ...state, hiddenTurns: [...next].sort((a, b) => a - b) };
+      }
+      case RESTORE_RECORD: {
+        const turns = Array.isArray(event.data?.turns) ? event.data.turns : [];
+        if (turns.length === 0) return state;
+        const next = new Set(state.hiddenTurns);
+        for (const turn of turns) next.delete(turn);
+        return { ...state, hiddenTurns: [...next].sort((a, b) => a - b) };
       }
       default:
         return state;
@@ -362,7 +402,7 @@ const mdOutlineProjectionDefinition = {
   },
   wire: {
     viewSchema,
-    view: (state) => state.visibleTurns,
+    view: (state) => ({ turns: state.visibleTurns, hiddenTurns: state.hiddenTurns }),
   },
 };
 
@@ -649,8 +689,6 @@ function searchSessionAssistantEvents(events, rawQuery) {
 // ---------------------------------------------------------------------------
 
 /** This plugin's own durable record types, under its package name. */
-const HIDE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn';
-const RESTORE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn-restored';
 
 /** Prompt-context name and placement for the running hidden-turn ledger. */
 const HIDDEN_CONTEXT_NAME = 'md-outline:hidden-turns';

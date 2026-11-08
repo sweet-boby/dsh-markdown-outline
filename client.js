@@ -1650,10 +1650,11 @@ window.__ModuleLoader__.load({
      * Merge whole-log Host `mdOutline` projection with live loaded `useChat` turns,
      * computing normalized indentation levels and tree parent relationships.
      */
-    function buildMergedOutline(projectedTurns, loadedOutline) {
+    function buildMergedOutline(projectedTurns, loadedOutline, hiddenTurnNums) {
       const loadedByTurn = new Map();
       const loadedNums = new Set(loadedOutline.loadedTurnSet);
       for (const t of loadedOutline.turns) loadedByTurn.set(t.turn, t);
+      const hidden = new Set(hiddenTurnNums ?? []);
 
       const allTurnNums = new Set();
       const projectedByTurn = new Map();
@@ -1671,6 +1672,9 @@ window.__ModuleLoader__.load({
       const groups = [];
 
       for (const turnNum of sortedNums) {
+        // A hidden turn leaves the outline entirely; it stays addressable only
+        // through the hidden-turn list, which offers the restore action.
+        if (hidden.has(turnNum)) continue;
         const isLoaded = loadedNums.has(turnNum);
         const lt = loadedByTurn.get(turnNum);
         const pt = projectedByTurn.get(turnNum);
@@ -2356,9 +2360,13 @@ window.__ModuleLoader__.load({
           const hasMore = useSession((s) => s.hasMore);
           const projected = useProjection('mdOutline');
           const loaded = useChat(selectLoadedOutline, equalLoadedOutline);
+          // The projection carries both the outline and the hidden-turn ledger;
+          // a client that sees an older array-only value still renders.
+          const projectedTurns = Array.isArray(projected) ? projected : (projected?.turns ?? null);
+          const hiddenTurns = Array.isArray(projected?.hiddenTurns) ? projected.hiddenTurns : EMPTY_TURNS;
           const groups = useMemo(
-            () => buildMergedOutline(projected, loaded),
-            [projected, loaded],
+            () => buildMergedOutline(projectedTurns, loaded, hiddenTurns),
+            [projectedTurns, loaded, hiddenTurns],
           );
 
           useEffect(() => {
@@ -2370,9 +2378,10 @@ window.__ModuleLoader__.load({
               loadedTurnNums: loaded.loadedTurnSet,
               allSteps: loaded.allSteps,
               groups,
+              hiddenTurns,
               loadThrough,
             });
-          }, [sessionId, running, hasMore, loaded, groups, loadThrough]);
+          }, [sessionId, running, hasMore, loaded, groups, hiddenTurns, loadThrough]);
 
           useEffect(() => {
             return () => {
@@ -2757,7 +2766,30 @@ window.__ModuleLoader__.load({
             () => new Set(selection.entries.map((it) => it.id)),
             [selection.entries],
           );
-          const hiddenTurnNums = hiddenState.bySession[bridge.sessionId] ?? EMPTY_TURNS;
+          // The projection is authoritative after a hide lands; the local store
+          // covers the moment between the request and the projection update.
+          const hiddenTurnNums = useMemo(() => {
+            const merged = new Set(bridge.hiddenTurns ?? []);
+            for (const turn of hiddenState.bySession[bridge.sessionId] ?? []) merged.add(turn);
+            return [...merged].sort((a, b) => a - b);
+          }, [bridge.hiddenTurns, hiddenState.bySession, bridge.sessionId]);
+
+          // The transcript marks every rendered row with data-chat-turn, so a
+          // hidden turn leaves the conversation by rule rather than by wrapping
+          // the shipped renderers. The style element lives and dies with this
+          // component, which keeps the page clean when the plugin unloads.
+          useEffect(() => {
+            if (hiddenTurnNums.length === 0 || typeof document === 'undefined') return undefined;
+            const styleEl = document.createElement('style');
+            styleEl.setAttribute('data-dsh-plugin', 'dsh-markdown-outline-transcript');
+            styleEl.textContent = hiddenTurnNums
+              .map((turn) => `[data-chat-turn="${turn}"]`)
+              .join(',\n') + ' { display: none !important; }';
+            document.head.appendChild(styleEl);
+            return () => {
+              styleEl.remove();
+            };
+          }, [hiddenTurnNums]);
 
           useEffect(() => {
             if (notice === null) return undefined;
