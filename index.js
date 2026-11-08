@@ -865,6 +865,10 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
     'assistant/message',
     'tool/result',
   ]);
+  // A system prompt may only be rewritten by a system message over exactly that
+  // node, so a replacement issued here can never span one. Skipping it lets the
+  // rest of its turn hide; the prompt itself always stays in the context.
+  const unshadowable = new Set(['system/message', 'developer/message']);
   // Walk the surface in its own order, not the log's: a replacement addresses
   // positions, so a range assembled from log order can name a start that sits
   // after its end.
@@ -891,6 +895,11 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
     const turn = turnOfSeq.get(seq);
     if (event === undefined || turn === undefined) continue;
     if (!surfaceTypes.has(event.type) || event.surfaceOp === undefined) continue;
+    if (unshadowable.has(event.type)) {
+      // Still a boundary: the run must stop rather than span this node.
+      ordered.push({ turn: null });
+      continue;
+    }
     if (!selectedTurns.has(turn)) {
       // Any node that is not part of the selection ends the run: one
       // replacement must never shadow content the reader did not pick.

@@ -459,3 +459,43 @@ test('an unselected turn between two selected ones breaks the run', () => {
   assert.ok(runs.length >= 2, 'the gap splits the plan into separate runs')
   assert.deepEqual([...new Set(runs.flatMap((r) => r.turns))].sort((a, b) => a - b), [1, 3])
 })
+
+test('a system prompt is never part of a hide range', () => {
+  const log = buildSessionLog(TURNS)
+
+  // A turn can own a system message — a mid-conversation prompt re-issued by
+  // the runtime. Only a system message may rewrite that node, so a hide range
+  // spanning it is rejected.
+  // Insert inside turn 2's own stretch of the log, so the node genuinely belongs
+  // to turn 2 rather than to whatever turn comes last.
+  const sysEvent = {
+    type: 'system/message',
+    seq: 100,
+    time: 0,
+    data: { turn: 2, step: 1, message: { content: [{ type: 'text', text: 'system prompt' }] } },
+    surfaceOp: 'append',
+  }
+  const turn2Start = log.findIndex((event) => event.type === 'turn/start' && event.data?.turn === 2)
+  const turn3Start = log.findIndex((event) => event.type === 'turn/start' && event.data?.turn === 3)
+  log.splice(turn3Start > -1 ? turn3Start : turn2Start + 1, 0, sysEvent)
+
+  const live = internals.foldLiveSurface(log)
+  const picked = surfaceSeqsOfTurns(log, new Set([2]), live)
+  const runs = splitIntoContiguousRuns(picked.byTurn, picked.order)
+
+  const bySeq = new Map(log.map((event) => [event.seq, event]))
+  for (const run of runs) {
+    for (const seq of run.seqs) {
+      const type = bySeq.get(seq)?.type
+      assert.ok(
+        type !== 'system/message' && type !== 'developer/message',
+        `the range must not contain a ${type} node`,
+      )
+    }
+  }
+  assert.ok(runs.length > 0, 'the rest of the turn still hides')
+  assert.ok(
+    runs.some((run) => run.turns.includes(2)),
+    'turn 2 is still planned',
+  )
+})
