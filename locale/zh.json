@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Markdown 对话目录",
+    "description": "在对话页面左侧分栏展示整段会话 AI 回复的 Markdown 目录大纲，支持标题与正文搜索、点击跳转及展开收起"
+  }
+}

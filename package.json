@@ -1,0 +1,53 @@
+{
+  "name": "dsh-markdown-outline",
+  "version": "1.0.0",
+  "description": "Feishu-style Markdown outline for DSH: a collapsible split-column table of contents on the left of the conversation page, built from the Markdown headings of every AI reply, with heading and full-reply keyword search that also reaches unloaded history.",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "markdown",
+    "outline",
+    "toc",
+    "table-of-contents",
+    "conversation",
+    "navigation",
+    "search"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  }
+}
