@@ -53,6 +53,16 @@ Ticking a turn hides that turn whole: its prompt and its replies leave the model
 
 A hide appends one `user/message` carrying `surfaceOp: { op: 'replace', startSeq, endSeq }` over the selected turns' surface nodes, so the model-visible surface stops carrying them while the event log keeps every original event. One `replace` shadows exactly one contiguous range, so a gap between two selected turns starts a new range rather than widening the span — that is what keeps unselected turns out of the replacement. The replacement names the hidden turns and tells the model not to reference them. Two ignorable plugin records, `plugin:dsh-markdown-outline/hidden-turn` and `plugin:dsh-markdown-outline/hidden-turn-restored`, form the durable ledger; a runtime prompt context reads that ledger from the live session log on every request, so the model also knows which turns are absent. Restoring writes a ledger entry that drops the turns and appends a short message marking them visible again — the original messages are not replayed into the surface, because DSH cannot reintroduce shadowed events.
 
+## Testing
+
+```sh
+npm test
+```
+
+The suite runs on Node's built-in test runner with no dependencies. [`tests/hidden-turns.test.mjs`](tests/hidden-turns.test.mjs) covers the Host rules — which surface nodes belong to a turn, how selected turns split into contiguous replacement runs, and how the ledger and projection fold hides and restores. [`tests/client.test.mjs`](tests/client.test.mjs) mounts the client half under a fake DOM and asserts that a hidden turn leaves the outline and that the transcript rule names exactly the hidden turns.
+
+`tests/fixtures.mjs` writes event logs in the order the agent loop actually appends them (`turn/start`, `step/start`, runtime context, prompt, reply, `step/end`, `turn/end`), because the turn and surface rules depend on that ordering.
+
 ## Limitations
 
 - Headings are recognized in ATX (`#`) and Setext (`===`, `---`) form inside non-reasoning assistant text; headings the model emits inside nested blockquotes or list continuations inherit the reduced heading level the renderer applies, and a heading inside a collapsed details block is not extracted.

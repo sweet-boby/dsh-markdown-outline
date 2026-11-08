@@ -938,6 +938,7 @@ function sendJson(res, status, payload) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
+
   ctx.inject(['sessionProjections'], (scope) => {
     scope.sessionProjections.register(mdOutlineProjectionDefinition);
   });
@@ -1169,3 +1170,27 @@ export function apply(ctx) {
     );
   });
 }
+
+/**
+ * Pure internals, exported for the unit tests only.
+ *
+ * The plugin surface is `apply`; these values have no runtime consumer outside
+ * this module and exist so the folding, selection and splitting rules can be
+ * exercised without booting a Host.
+ */
+export const internals = {
+  cleanHeadingText,
+  extractBlockHeadings,
+  previewPrompt,
+  mdOutlineProjectionDefinition,
+  searchBlockBody,
+  searchSessionAssistantEvents,
+  foldHiddenTurns,
+  surfaceSeqsOfTurns,
+  splitIntoContiguousRuns,
+  renderHiddenContext,
+  buildHideMessage,
+  buildRestoreMessage,
+  HIDE_RECORD,
+  RESTORE_RECORD,
+};

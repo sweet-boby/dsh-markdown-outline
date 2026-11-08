@@ -53,6 +53,16 @@ bundle 会向 profile patch 插入一行 `md-outline`，卸载本包时该行一
 
 隐藏会追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的 `user/message`，覆盖所选轮次的 surface 节点：模型可见的 surface 不再包含它们，而事件日志保留全部原始事件。一次 `replace` 只能遮蔽一个连续区间，因此两个被勾选轮次之间若有空隙，会从空隙处另起一段，而不是把区间拉宽——这正是未勾选轮次不会被一起隐藏的原因。替代消息会写明被隐藏的轮次，并要求模型不要引用它们。两条可忽略的插件记录 `plugin:dsh-markdown-outline/hidden-turn` 与 `plugin:dsh-markdown-outline/hidden-turn-restored` 构成持久账本；运行时提示词上下文在每次请求前从 live session 日志读取该账本，因此模型也知道哪些轮次不在上下文中。恢复只写入一条移除这些轮次的账本记录并追加一条说明消息——原始消息不会被重新放回 surface，因为 DSH 无法把已被遮蔽的事件重新引入。
 
+## 测试
+
+```sh
+npm test
+```
+
+测试跑在 Node 内置的测试运行器上，不依赖任何第三方包。[`tests/hidden-turns.test.mjs`](tests/hidden-turns.test.mjs) 覆盖宿主侧规则——哪些 surface 节点属于某一轮、勾选的轮次如何切成连续替换段、账本与投影如何折叠隐藏与恢复；[`tests/client.test.mjs`](tests/client.test.mjs) 在伪 DOM 下挂载客户端，断言被隐藏的轮次会离开目录栏，且聊天区规则精确点名被隐藏的轮次。
+
+`tests/fixtures.mjs` 按 agent loop 的真实追加顺序写事件日志（`turn/start`、`step/start`、运行时上下文、提问、回复、`step/end`、`turn/end`），因为轮次与 surface 规则依赖这个顺序。
+
 ## 已知限制
 
 - 标题识别覆盖非思考文本中的 ATX（`#`）与 Setext（`===`、`---`）两种写法；模型写在嵌套引用或列表续行里的标题沿用渲染器降级后的层级，折叠 details 块内的标题不会被提取。

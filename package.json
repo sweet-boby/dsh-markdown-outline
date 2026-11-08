@@ -18,6 +18,9 @@
   "license": "MIT",
   "type": "module",
   "icon": "./icon.svg",
+  "scripts": {
+    "test": "node --import ./tests/register-stub.mjs --test \"tests/*.test.mjs\""
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
