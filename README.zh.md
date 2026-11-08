@@ -49,7 +49,9 @@ bundle 会向 profile patch 插入一行 `md-outline`，卸载本包时该行一
 
 ### 隐藏一个轮次
 
-隐藏会追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的 `user/message`，覆盖所选轮次的 surface 节点：模型可见的 surface 不再包含它们，而事件日志保留全部原始事件。替代消息会写明被隐藏的轮次，并要求模型不要引用它们。两条可忽略的插件记录 `plugin:dsh-markdown-outline/hidden-turn` 与 `plugin:dsh-markdown-outline/hidden-turn-restored` 构成持久账本；运行时提示词上下文在每次请求前从 live session 日志读取该账本，因此模型也知道哪些轮次不在上下文中。恢复只写入一条移除这些轮次的账本记录并追加一条说明消息——原始消息不会被重新放回 surface，因为 DSH 无法把已被遮蔽的事件重新引入。
+勾选一轮就隐藏整轮：这一轮的提问和回复一起离开模型可见面，没有勾选的轮次保持原样。轮次标题上的勾选框会一次性写入该轮的全部标题，一次操作覆盖一次完整问答。
+
+隐藏会追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的 `user/message`，覆盖所选轮次的 surface 节点：模型可见的 surface 不再包含它们，而事件日志保留全部原始事件。一次 `replace` 只能遮蔽一个连续区间，因此两个被勾选轮次之间若有空隙，会从空隙处另起一段，而不是把区间拉宽——这正是未勾选轮次不会被一起隐藏的原因。替代消息会写明被隐藏的轮次，并要求模型不要引用它们。两条可忽略的插件记录 `plugin:dsh-markdown-outline/hidden-turn` 与 `plugin:dsh-markdown-outline/hidden-turn-restored` 构成持久账本；运行时提示词上下文在每次请求前从 live session 日志读取该账本，因此模型也知道哪些轮次不在上下文中。恢复只写入一条移除这些轮次的账本记录并追加一条说明消息——原始消息不会被重新放回 surface，因为 DSH 无法把已被遮蔽的事件重新引入。
 
 ## 已知限制
 

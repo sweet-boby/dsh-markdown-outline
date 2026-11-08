@@ -787,6 +787,36 @@ function surfaceSeqsOfTurns(events, selectedTurns) {
 }
 
 /**
+ * Group owned seqs into the contiguous runs one `replace` operation can shadow.
+ *
+ * `surfaceOp: { op: 'replace' }` shadows exactly one inclusive range of current
+ * surface nodes, so an unselected turn sitting between two selected turns would
+ * be swallowed by a single span. Splitting on gaps keeps every unselected turn
+ * out of the replacement, which is what "hide only the ticked turns" means.
+ * @param {ReadonlyArray<{ turn: number, seqs: readonly number[] }>} byTurn
+ *   selected turns with the seqs each owns, in log order.
+ * @returns {Array<{ seqs: number[], turns: number[] }>} one run per contiguous span.
+ */
+function splitIntoContiguousRuns(byTurn) {
+  const runs = [];
+  let current = null;
+  for (const entry of byTurn) {
+    const first = entry.seqs[0];
+    const last = entry.seqs[entry.seqs.length - 1];
+    if (first === undefined || last === undefined) continue;
+    if (current !== null && first === current.last + 1) {
+      current.seqs.push(...entry.seqs);
+      current.turns.push(entry.turn);
+      current.last = last;
+      continue;
+    }
+    current = { seqs: [...entry.seqs], turns: [entry.turn], last };
+    runs.push(current);
+  }
+  return runs.map((run) => ({ seqs: run.seqs, turns: run.turns }));
+}
+
+/**
  * Render the hidden-turn ledger as the runtime context the model reads.
  * @param {ReturnType<typeof foldHiddenTurns>} ledger
  * @returns {string} the context text, or '' when nothing is hidden.
@@ -810,6 +840,7 @@ function renderHiddenContext(ledger) {
  * @returns {object} a user message for `session.append`.
  */
 function buildHideMessage(turns, shadowedCount) {
+  const plural = turns.length === 1 ? '' : 's';
   return {
     id: `md-outline-hidden-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     role: 'user',
@@ -817,8 +848,9 @@ function buildHideMessage(turns, shadowedCount) {
       type: 'text',
       text: [
         `<hidden-turns count="${turns.length}" shadowed="${shadowedCount}">`,
-        `The user hid turn${turns.length === 1 ? '' : 's'} ${turns.join(', ')} from this conversation.`,
-        'Those messages are no longer part of the history and must not be referenced, quoted, or summarized.',
+        `The user hid turn${plural} ${turns.join(', ')} from this conversation.`,
+        `Turn${plural} ${turns.join(', ')}: the user's prompt${plural} and the assistant's repl${turns.length === 1 ? 'y' : 'ies'} are both gone from the history.`,
+        'Do not reference, quote, summarize, or claim to remember them.',
         '</hidden-turns>',
       ].join('\n'),
     }],
@@ -989,11 +1021,16 @@ export function apply(ctx) {
             sendJson(res, 409, { code: 'nothing-to-hide', message: 'the selected turns carry no model-visible content' });
             return;
           }
+          // One replacement shadows one contiguous range, so unselected turns
+          // between two selected ones need a run break rather than a wider span.
+          const runs = splitIntoContiguousRuns(picked.byTurn);
           try {
-            session.append('user/message', buildHideMessage(picked.turns, picked.seqs.length), {
-              surfaceOp: { op: 'replace', startSeq: picked.seqs[0], endSeq: picked.seqs[picked.seqs.length - 1] },
-              sourceEventSeqs: picked.seqs,
-            });
+            for (const run of runs) {
+              session.append('user/message', buildHideMessage(run.turns, run.seqs.length), {
+                surfaceOp: { op: 'replace', startSeq: run.seqs[0], endSeq: run.seqs[run.seqs.length - 1] },
+                sourceEventSeqs: run.seqs,
+              });
+            }
             appendPluginRecord(session, HIDE_RECORD, {
               turns: picked.byTurn,
               hiddenAt: Date.now(),

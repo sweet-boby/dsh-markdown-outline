@@ -76,7 +76,7 @@ window.__ModuleLoader__.load({
       hiddenEmpty: 'No hidden turns',
       hideTurns: 'Hide {count} turns',
       hideTurnsExplain:
-        'Hidden turns disappear from this conversation and are not sent to the model. The original log keeps them, so you can restore them at any time.',
+        'Each ticked turn is hidden whole — your prompt and the AI reply both leave this conversation and stop being sent to the model. Only the ticked turns are affected. The original log keeps them, so you can restore them at any time.',
       hideConfirm: 'Hide',
       hideCancel: 'Cancel',
       restoreTurn: 'Show again',
@@ -122,7 +122,7 @@ window.__ModuleLoader__.load({
       hiddenEmpty: '没有被隐藏的轮次',
       hideTurns: '隐藏 {count} 个轮次',
       hideTurnsExplain:
-        '被隐藏的轮次会从这段对话中消失，也不会再发送给模型。原始会话日志仍然保留，随时可以恢复。',
+        '每勾选一轮就隐藏整轮——你的提问和 AI 的回复都会从这段对话中消失，也不再发送给模型。只有勾选的轮次受影响，没勾选的保持不变。原始会话日志仍然保留，随时可以恢复。',
       hideConfirm: '隐藏',
       hideCancel: '取消',
       restoreTurn: '重新显示',
@@ -865,6 +865,25 @@ window.__ModuleLoader__.load({
   font-weight: 500;
   text-align: left;
   cursor: pointer;
+}
+
+/* The turn header carries its own checkbox, aligned with the heading column
+   so ticking a whole turn reads as one action over the rows below it. */
+.dsh-mdo-turn-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 4px;
+}
+
+.dsh-mdo-turn-row .dsh-mdo-turn-btn {
+  margin-bottom: 0;
+}
+
+.dsh-mdo-turn-row .dsh-mdo-turn-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dsh-mdo-turn-btn:hover {
@@ -3541,6 +3560,11 @@ window.__ModuleLoader__.load({
                         ? h('div', { className: 'dsh-mdo-empty' }, t('empty'))
                         : bridge.groups.map((group) => {
                             const turnCollapsed = collapsedTurns.has(group.turn);
+                            // A turn counts as ticked when every one of its headings is
+                            // selected; the header checkbox then writes that whole set.
+                            const turnChecked =
+                              group.items.length > 0 &&
+                              group.items.every((it) => selectedIds.has(it.id));
                             const itemMap = new Map(group.items.map((it) => [it.id, it]));
                             const isHiddenByAncestor = (item) => {
                               let pid = item.parentId;
@@ -3560,16 +3584,49 @@ window.__ModuleLoader__.load({
                               { key: group.turn, className: 'dsh-mdo-turn-group' },
                               showTurnHeaders
                                 ? h(
-                                    'button',
-                                    {
-                                      type: 'button',
-                                      className: 'dsh-mdo-turn-btn',
-                                      title: turnTitle,
-                                      'aria-expanded': !turnCollapsed,
-                                      onClick: () => toggleTurnFold(group.turn),
-                                    },
-                                    h(IconCaret, { collapsed: turnCollapsed }),
-                                    h('span', { className: 'dsh-mdo-turn-text' }, turnTitle),
+                                    'div',
+                                    { className: 'dsh-mdo-turn-row' },
+                                    selecting
+                                      ? h(
+                                          'button',
+                                          {
+                                            type: 'button',
+                                            className: 'dsh-mdo-check',
+                                            'data-checked': turnChecked ? 'true' : undefined,
+                                            'aria-checked': turnChecked,
+                                            role: 'checkbox',
+                                            'aria-label': turnTitle,
+                                            title: turnTitle,
+                                            onClick: () => {
+                                              const rows = flattenGroupRows(group);
+                                              const next = !turnChecked;
+                                              for (const row of rows) {
+                                                const entry = buildSectionSelection(
+                                                  group,
+                                                  row.item,
+                                                  bridge.allSteps,
+                                                  row.path,
+                                                );
+                                                const on = selectedIds.has(row.item.id);
+                                                if (on !== next) selectionStore.toggleEntry(entry);
+                                              }
+                                            },
+                                          },
+                                          turnChecked ? h(IconCheck) : null,
+                                        )
+                                      : null,
+                                    h(
+                                      'button',
+                                      {
+                                        type: 'button',
+                                        className: 'dsh-mdo-turn-btn',
+                                        title: turnTitle,
+                                        'aria-expanded': !turnCollapsed,
+                                        onClick: () => toggleTurnFold(group.turn),
+                                      },
+                                      h(IconCaret, { collapsed: turnCollapsed }),
+                                      h('span', { className: 'dsh-mdo-turn-text' }, turnTitle),
+                                    ),
                                   )
                                 : null,
                               turnCollapsed
