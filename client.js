@@ -66,6 +66,8 @@ window.__ModuleLoader__.load({
       selectionBar: 'Attached {count} sections — sent with your next message',
       openSelection: 'Open selection',
       selectionTitle: 'Referenced sections',
+      confirmReference: 'Attach',
+      detachReference: 'Remove reference',
       selectionClose: 'Close',
       selectionEmpty: 'Nothing selected yet',
       clearSelection: 'Clear selection',
@@ -110,6 +112,8 @@ window.__ModuleLoader__.load({
       selectionBar: '已附加 {count} 个章节，随下一条消息一起发送',
       openSelection: '查看引用',
       selectionTitle: '已引用章节',
+      confirmReference: '确认附加',
+      detachReference: '移除引用',
       selectionClose: '关闭',
       selectionEmpty: '还没有选中任何章节',
       clearSelection: '清空选择',
@@ -2211,6 +2215,12 @@ window.__ModuleLoader__.load({
       return { ok: resp.ok, body };
     }
 
+    /**
+     * Selection state machine, exposed for the unit tests that assert the
+     * confirm gate. This is the only consumer besides `apply`.
+     */
+    const selectionInternals = { createSelectionStore };
+
     const EMPTY_BRIDGE = Object.freeze({
       active: false,
       sessionId: null,
@@ -2235,7 +2245,16 @@ window.__ModuleLoader__.load({
      * the session id the Host routes need.
      */
     function createSelectionStore() {
-      let state = { entries: [], selecting: false, sidebarOpen: false, confirmIds: null };
+      // `entries` is the live tick list; `attached` is what the reader confirmed
+      // and what the composer card shows. Confirming copies one to the other so
+      // further ticking never silently changes what will be sent.
+      let state = {
+        entries: [],
+        attached: [],
+        selecting: false,
+        sidebarOpen: false,
+        confirmIds: null,
+      };
       const listeners = new Set();
       const read = () => state;
       const write = (next) => {
@@ -2262,7 +2281,15 @@ window.__ModuleLoader__.load({
           });
         },
         removeEntry: (id) => write({ ...state, entries: state.entries.filter((it) => it.id !== id) }),
+        removeAttached: (id) => write({
+          ...state,
+          attached: state.attached.filter((it) => it.id !== id),
+        }),
         clearEntries: () => write({ ...state, entries: [], selecting: false }),
+        /** Confirm the live selection as the reference that travels with the message. */
+        attachEntries: () => write({ ...state, attached: [...state.entries], selecting: false, sidebarOpen: false }),
+        /** Drop the attached reference without touching the live selection. */
+        detach: () => write({ ...state, attached: [], sidebarOpen: false }),
         requestHide: (ids) => write({ ...state, confirmIds: ids }),
         cancelHide: () => write({ ...state, confirmIds: null }),
         finishHide: (ids) => write({
@@ -2270,7 +2297,13 @@ window.__ModuleLoader__.load({
           confirmIds: null,
           entries: state.entries.filter((it) => !ids.has(it.id)),
         }),
-        reset: () => write({ entries: [], selecting: false, sidebarOpen: false, confirmIds: null }),
+        reset: () => write({
+          entries: [],
+          attached: [],
+          selecting: false,
+          sidebarOpen: false,
+          confirmIds: null,
+        }),
       };
     }
 
@@ -2316,6 +2349,7 @@ window.__ModuleLoader__.load({
     return {
       name: 'md-outline',
       inject: ['slots', 'locale', 'sessions'],
+      internals: selectionInternals,
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, 'en', EN_DICT));
         ctx.effect(() => ctx.locale.register(NS, 'zh', ZH_DICT));
@@ -2429,7 +2463,11 @@ window.__ModuleLoader__.load({
           const selection = useSelection((s) => s);
           const [busy, setBusy] = useState(false);
           const [notice, setNotice] = useState(null);
-          /** The reference text already handed to the Host, to avoid re-posting it. */
+          /**
+           * The reference text already handed to the Host. `null` means this
+           * mount has said nothing yet: an empty attachment then stays silent,
+           * while the first real change always reaches the Host.
+           */
           const lastAttachedRef = useRef(null);
 
           useEffect(() => {
@@ -2446,21 +2484,26 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId]);
 
-          // The composer stays plain text: the reference lives in the card and
-          // the Host attaches it to the next step, so nothing is written into
-          // the draft the reader types in. Only the attachment changes here.
+          // Only a confirmed attachment reaches the Host. The composer stays
+          // plain text, and ticking more headings afterwards changes nothing
+          // about what will be sent until the reader confirms again.
           useEffect(() => {
-            const entries = selection.entries;
+            const entries = selection.attached;
             const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
             if (next === lastAttachedRef.current) return;
+            if (next === '' && lastAttachedRef.current === null) {
+              // Nothing attached at mount: there is nothing to detach yet.
+              lastAttachedRef.current = '';
+              return;
+            }
             lastAttachedRef.current = next;
             void postRoute(SET_REFERENCE_ROUTE, { sessionId, text: next }).catch(() => {
               // A failed attach is reported once; the card still shows what the
-              // reader picked, so the next selection change retries.
+              // reader confirmed, so the next confirmation retries.
               lastAttachedRef.current = null;
               setNotice({ text: t('attachFailed') });
             });
-          }, [selection.entries, sessionId, t]);
+          }, [selection.attached, sessionId, t]);
 
           const applyHidden = useCallback(async (rawTurns, route) => {
             if (busy) return;
@@ -2506,8 +2549,11 @@ window.__ModuleLoader__.load({
             return [...all].sort((a, b) => a - b);
           }, [confirmIds, selection.entries]);
 
+          // The card is the confirmed attachment: it appears only after the
+          // reader confirms, and it is what the next message carries.
+          const attached = selection.attached;
           const card =
-            selection.entries.length === 0
+            attached.length === 0
               ? null
               : h(
                   'div',
@@ -2525,12 +2571,12 @@ window.__ModuleLoader__.load({
                     h(
                       'span',
                       { className: 'dsh-mdo-refcard-text' },
-                      t('selectionBar', { count: selection.entries.length }),
+                      t('selectionBar', { count: attached.length }),
                     ),
                     h(
                       'span',
                       { className: 'dsh-mdo-refcard-count' },
-                      String(selection.entries.length),
+                      String(attached.length),
                     ),
                   ),
                 );
@@ -2562,9 +2608,9 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { className: 'dsh-mdo-side-body' },
-                  selection.entries.length === 0
+                  attached.length === 0
                     ? h('div', { className: 'dsh-mdo-empty' }, t('selectionEmpty'))
-                    : selection.entries.map((entry) =>
+                    : attached.map((entry) =>
                         h(
                           'div',
                           { key: entry.id, className: 'dsh-mdo-sel-item' },
@@ -2585,7 +2631,7 @@ window.__ModuleLoader__.load({
                                 className: 'dsh-mdo-sel-item-remove',
                                 title: t('clearSelection'),
                                 'aria-label': t('clearSelection'),
-                                onClick: () => selectionStore.removeEntry(entry.id),
+                                onClick: () => selectionStore.removeAttached(entry.id),
                               },
                               h(IconClear),
                             ),
@@ -2600,17 +2646,15 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { className: 'dsh-mdo-side-foot' },
-                  // The reference already travels with the draft; this panel is
-                  // for reading and removing, so it offers no separate insert.
                   h(
                     'button',
                     {
                       type: 'button',
                       className: 'dsh-mdo-btn',
-                      disabled: selection.entries.length === 0,
-                      onClick: () => selectionStore.clearEntries(),
+                      disabled: attached.length === 0,
+                      onClick: () => selectionStore.detach(),
                     },
-                    t('clearSelection'),
+                    t('detachReference'),
                   ),
                 ),
               )
@@ -3968,12 +4012,23 @@ window.__ModuleLoader__.load({
                             type: 'button',
                             className: 'dsh-mdo-btn',
                             disabled: selection.entries.length === 0,
-                            onClick: () =>
-                              selectionStore.requestHide(
-                                new Set(selection.entries.map((it) => it.id)),
-                              ),
+                            onClick: () => selectionStore.requestHide(
+                              new Set(selection.entries.map((it) => it.id)),
+                            ),
                           },
                           t('hideConfirm'),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-mdo-btn',
+                            'data-primary': 'true',
+                            disabled: selection.entries.length === 0,
+                            title: t('confirmReference'),
+                            onClick: () => selectionStore.attachEntries(),
+                          },
+                          t('confirmReference'),
                         ),
                       )
                     : null,

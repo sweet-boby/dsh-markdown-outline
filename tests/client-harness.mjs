@@ -35,6 +35,12 @@ function createReactStub() {
     return node
   }
 
+  // Refs must survive across renders of the same component instance the way
+  // React's do, or an effect that keys off a ref would look stateless here and
+  // pass while failing in the browser.
+  let refs = []
+  let refCursor = 0
+
   const React = {
     createElement: record,
     createPortal: (node) => node,
@@ -47,9 +53,29 @@ function createReactStub() {
       }
     },
     useMemo: (fn) => fn(),
-    useRef: (value) => ({ current: value }),
+    useRef: (value) => {
+      // The cursor walks the mount's slots in call order, so the second render
+      // of one component sees the same object the first render created.
+      if (refCursor < refs.length) {
+        refCursor += 1
+        return refs[refCursor - 1]
+      }
+      const created = { current: value }
+      refs.push(created)
+      refCursor += 1
+      return created
+    },
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
     Fragment: 'Fragment',
+    /** Reset the hook slots for a new mount. */
+    __mount: () => {
+      refs = []
+      refCursor = 0
+    },
+    /** Start another render of the same mounted tree. */
+    __render: () => {
+      refCursor = 0
+    },
   }
 
   return { React, rendered, nodes }
@@ -155,6 +181,7 @@ export function loadClient() {
 
   return {
     plugin: loadedPlugin,
+    internals: loadedPlugin.internals,
     registered,
     injected,
     head,
@@ -163,6 +190,8 @@ export function loadClient() {
     setFetch: (impl) => {
       fetchImpl = impl
     },
+    /** Begin another render of the same mounted tree, reusing its refs. */
+    __render: () => React.__render(),
   }
 }
 

@@ -184,10 +184,10 @@ test('the hiding rule survives the outline unmounting', () => {
 
 /**
  * Render the composer dock with recording Host routes.
- * @param {{ entries: object[], draft?: string }} options - the selection to attach.
- * @returns {{ posts: object[], writes: string[] }} recorded Host calls and draft writes.
+ * @param {{ entries?: object[], attached?: object[] }} options - live tick list and confirmed attachment.
+ * @returns {{ posts: object[], writes: string[] }} recorded Host calls.
  */
-function renderDock({ entries }) {
+function renderDock({ entries = [], attached = [] }) {
   const client = loadClient()
   const dock = client.registered.get('md-outline-reference')
   assert.ok(dock !== undefined, 'the composer dock must be registered')
@@ -202,6 +202,7 @@ function renderDock({ entries }) {
   dock({
     useSelection: (selector) => selector({
       entries,
+      attached,
       selecting: entries.length > 0,
       sidebarOpen: false,
       confirmIds: null,
@@ -211,7 +212,8 @@ function renderDock({ entries }) {
     t: (key, params) => (params === undefined ? key : `${key}:${JSON.stringify(params)}`),
   })
 
-  return { posts, writes, client }
+  const attach = posts.filter((post) => post.url.includes('md-outline/reference')).at(-1)
+  return { posts, writes, attach }
 }
 
 const ENTRY = {
@@ -224,20 +226,76 @@ const ENTRY = {
   path: [],
 }
 
-test('ticking a heading attaches the reference to the Host instead of writing the draft', () => {
-  const { posts, writes } = renderDock({ entries: [ENTRY] })
-
-  const attach = posts.find((post) => post.url.includes('md-outline/reference'))
-  assert.ok(attach !== undefined, 'the dock must post the attachment')
-  assert.equal(attach.body.sessionId, 'session-1')
-  assert.match(attach.body.text, /First layer: Chinese tokenization/)
-  assert.match(attach.body.text, /Merging results goes through the Go service/)
+test('an unconfirmed selection never reaches the Host', () => {
+  const { attach, writes } = renderDock({ entries: [ENTRY] })
+  assert.equal(attach, undefined, 'ticking alone must not attach anything')
   assert.equal(writes.length, 0, 'the composer must stay plain text')
 })
 
-test('clearing the selection detaches the reference', () => {
-  const { posts } = renderDock({ entries: [] })
-  const attach = posts.find((post) => post.url.includes('md-outline/reference'))
-  assert.ok(attach !== undefined, 'clearing still tells the Host')
-  assert.equal(attach.body.text, '', 'an empty body detaches')
+test('a confirmed attachment travels with the next message', () => {
+  const { attach, writes } = renderDock({ attached: [ENTRY] })
+  assert.ok(attach !== undefined, 'the confirmed reference is posted')
+  assert.equal(attach.body.sessionId, 'session-1')
+  assert.match(attach.body.text, /First layer: Chinese tokenization/)
+  assert.match(attach.body.text, /Merging results goes through the Go service/)
+  assert.match(attach.body.text, /第 22 轮/)
+  assert.equal(writes.length, 0, 'the composer must stay plain text')
+})
+
+test('detaching posts an empty body so the Host forgets the reference', () => {
+  const client = loadClient()
+  const dock = client.registered.get('md-outline-reference')
+  const posts = []
+  client.setFetch(async (url, init) => {
+    posts.push({ url, body: JSON.parse(init.body) })
+    return { ok: true, json: async () => ({}) }
+  })
+
+  // Drive one dock through attach then detach, the way the reader does it.
+  let attached = [ENTRY]
+  const render = () => dock({
+    useSelection: (selector) => selector({
+      entries: [],
+      attached,
+      selecting: false,
+      sidebarOpen: false,
+      confirmIds: null,
+    }),
+    useHiddenTurns: (selector) => selector({ bySession: {} }),
+    sessionId: 'session-1',
+    t: (key) => key,
+  })
+
+  render()
+  const attachedPosts = posts.filter((post) => post.url.includes('reference'))
+  assert.equal(attachedPosts.length, 1, 'the confirmed attachment is posted once')
+  assert.match(attachedPosts[0].body.text, /First layer/)
+
+  // Detach within the same mount: the composer card goes away and the Host is
+  // told to forget the reference.
+  attached = []
+  client.__render()
+  render()
+  const detachPost = posts.filter((post) => post.url.includes('reference')).at(-1)
+  assert.equal(detachPost.body.text, '', 'detaching posts an empty body')
+})
+
+test('the confirm gate keeps ticking separate from what will be sent', () => {
+  const { internals } = loadClient()
+  const store = internals.createSelectionStore()
+
+  store.toggleEntry({ id: 'a', turn: 1, heading: 'A', body: '' })
+  store.setSelecting(true)
+  assert.equal(store.read().attached.length, 0, 'ticking alone attaches nothing')
+
+  store.attachEntries()
+  assert.equal(store.read().attached.length, 1, 'confirming attaches the ticked entry')
+  assert.equal(store.read().attached[0].id, 'a')
+  assert.equal(store.read().selecting, false, 'confirming leaves selection mode')
+
+  store.toggleEntry({ id: 'b', turn: 2, heading: 'B', body: '' })
+  assert.equal(store.read().attached.length, 1, 'ticking afterwards leaves the attachment alone')
+
+  store.detach()
+  assert.equal(store.read().attached.length, 0, 'detaching clears the attachment')
 })
