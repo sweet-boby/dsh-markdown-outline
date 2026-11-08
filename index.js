@@ -407,8 +407,12 @@ const mdOutlineProjectionDefinition = {
 };
 
 const SEARCH_ROUTE_PATH = '/md-outline/search';
+const SET_REFERENCE_ROUTE_PATH = '/md-outline/reference';
 const HIDE_ROUTE_PATH = '/md-outline/hide';
 const RESTORE_ROUTE_PATH = '/md-outline/restore';
+
+/** Durable record naming the reference the user attached to their next message. */
+const REFERENCE_RECORD = 'plugin:dsh-markdown-outline/pending-reference';
 const MAX_BODY_HITS = 80;
 const SNIPPET_RADIUS = 36;
 
@@ -746,6 +750,25 @@ function parseJsonObject(text) {
  * @returns {{ turns: Map<number, { turn: number, hideSeq: number, seqs: number[] }>, bySeq: Map<number, number>, seq: number }}
  *   hidden turns by number, the turn that owns each shadowed seq, and the last ledger seq.
  */
+/**
+ * Read the reference the user attached to their next message.
+ *
+ * The newest record wins, and a record may carry an empty body to clear an
+ * attachment. Only the newest value is meaningful: a reference is consumed by
+ * the next step, not accumulated.
+ * @param {ReadonlyArray<object>} events
+ * @returns {{ text: string, seq: number } | undefined} the pending reference.
+ */
+function foldPendingReference(events) {
+  let pending;
+  for (const event of events) {
+    if (event?.type !== REFERENCE_RECORD || event.ignorable !== true) continue;
+    const text = typeof event.data?.text === 'string' ? event.data.text : '';
+    pending = text.trim() === '' ? undefined : { text: event.data.text, seq: event.seq };
+  }
+  return pending;
+}
+
 function foldHiddenTurns(events) {
   const turns = new Map();
   const bySeq = new Map();
@@ -972,6 +995,31 @@ export function apply(ctx) {
     });
   });
 
+  // A reference the user attached from the outline rides along with their next
+  // message. `agent/pre-step` is the seam that owns what enters a step, so the
+  // reference arrives as one extra user message and the composer stays plain
+  // text. The record is cleared in the same step that consumes it.
+  ctx.inject(['sessions'], (scope) => {
+    scope.on('agent/pre-step', async (payload, next) => {
+      const decision = await next();
+      if (decision.kind !== 'enter') return decision;
+      const pending = foldPendingReference(payload.agent.session.snapshotEvents());
+      if (pending === undefined) return decision;
+      return {
+        ...decision,
+        messages: [
+          ...decision.messages,
+          {
+            id: `md-outline-reference-${pending.seq}`,
+            role: 'user',
+            content: [{ type: 'text', text: pending.text }],
+            source: { kind: 'outline-reference', plugin: 'dsh-markdown-outline' },
+          },
+        ],
+      };
+    });
+  });
+
   ctx.inject(['webServer', 'connection', 'sessions', 'sessionQuery'], (scope) => {
     const reject = (req, res) => {
       const rejection = scope.connection.requestRejection(req);
@@ -1091,6 +1139,34 @@ export function apply(ctx) {
     scope.effect(() =>
       scope.webServer.register({
         kind: 'exact',
+        path: SET_REFERENCE_ROUTE_PATH,
+        handler: async (req, res) => {
+          if (reject(req, res)) return;
+          const parsed = await readBody(req, res);
+          if (parsed === null) return;
+          const text = typeof parsed.body.text === 'string' ? parsed.body.text : '';
+          const session = scope.sessions.get(parsed.sessionId);
+          if (session === undefined) {
+            sendJson(res, 409, { code: 'session-not-live', message: 'open the session before attaching a reference' });
+            return;
+          }
+          try {
+            appendPluginRecord(session, REFERENCE_RECORD, { text, at: Date.now() });
+          } catch (error) {
+            sendJson(res, 500, {
+              code: 'reference-failed',
+              message: error instanceof Error ? error.message : 'attaching the reference failed',
+            });
+            return;
+          }
+          sendJson(res, 200, { attached: text.trim() !== '' });
+        },
+      }),
+    );
+
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
         path: RESTORE_ROUTE_PATH,
         handler: async (req, res) => {
           if (reject(req, res)) return;
@@ -1186,6 +1262,8 @@ export const internals = {
   searchBlockBody,
   searchSessionAssistantEvents,
   foldHiddenTurns,
+  foldPendingReference,
+  REFERENCE_RECORD,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,
   renderHiddenContext,

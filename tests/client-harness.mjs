@@ -108,13 +108,13 @@ export function loadClient() {
 
   let loadedPlugin = null
   const source = readFileSync(CLIENT_PATH, 'utf8')
+  // The plugin's Host calls go through this indirection so a test can record
+  // them without reaching into module scope.
+  let fetchImpl = async () => ({ ok: true, json: async () => ({}) })
+  const fetch = (url, init) => fetchImpl(url, init)
+
   const run = new Function('window', 'document', 'localStorage', 'fetch', source)
-  run(
-    window,
-    document,
-    { getItem: () => null, setItem() {} },
-    async () => ({ ok: true, json: async () => ({}) }),
-  )
+  run(window, document, { getItem: () => null, setItem() {} }, fetch)
 
   if (loadedPlugin === null) throw new Error('client factory did not produce a plugin')
 
@@ -153,7 +153,17 @@ export function loadClient() {
   }
   loadedPlugin.apply(ctx)
 
-  return { plugin: loadedPlugin, registered, injected, head, rendered, nodes }
+  return {
+    plugin: loadedPlugin,
+    registered,
+    injected,
+    head,
+    rendered,
+    nodes,
+    setFetch: (impl) => {
+      fetchImpl = impl
+    },
+  }
 }
 
 /**

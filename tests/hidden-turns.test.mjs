@@ -215,3 +215,38 @@ test('hide and restore messages describe whole turns', () => {
   const restore = buildRestoreMessage([2, 3]).content[0].text
   assert.match(restore, /restored turns 2, 3/)
 })
+
+test('only the newest reference attachment is pending', () => {
+  const log = buildSessionLog(TURNS)
+  assert.equal(internals.foldPendingReference(log), undefined, 'nothing pending without a record')
+
+  const push = (text) => {
+    log.push({
+      type: internals.REFERENCE_RECORD,
+      seq: log.length,
+      time: 0,
+      ignorable: true,
+      data: { text, at: 0 },
+    })
+  }
+
+  push('<md-outline-reference>A</md-outline-reference>')
+  assert.equal(internals.foldPendingReference(log).text, '<md-outline-reference>A</md-outline-reference>')
+
+  push('<md-outline-reference>B</md-outline-reference>')
+  assert.match(internals.foldPendingReference(log).text, /B/, 'the newest attachment wins')
+
+  push('   ')
+  assert.equal(internals.foldPendingReference(log), undefined, 'a blank body detaches the reference')
+})
+
+test('a reference without the ignorable marker is ignored', () => {
+  const log = buildSessionLog(TURNS)
+  log.push({
+    type: internals.REFERENCE_RECORD,
+    seq: log.length,
+    time: 0,
+    data: { text: 'forged' },
+  })
+  assert.equal(internals.foldPendingReference(log), undefined)
+})

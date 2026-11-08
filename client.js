@@ -32,6 +32,7 @@ window.__ModuleLoader__.load({
     const SEARCH_ROUTE = 'md-outline/search';
     const HIDE_ROUTE = 'md-outline/hide';
     const RESTORE_ROUTE = 'md-outline/restore';
+    const SET_REFERENCE_ROUTE = 'md-outline/reference';
     const DEFAULT_WIDTH = 252;
     const MIN_WIDTH = 180;
     const MAX_WIDTH = 420;
@@ -62,7 +63,7 @@ window.__ModuleLoader__.load({
       selectMode: 'Select sections',
       selectModeOn: 'Exit selection',
       selectedCount: '{count} selected',
-      selectionBar: '{count} referenced — sent with your next message',
+      selectionBar: 'Attached {count} sections — sent with your next message',
       openSelection: 'Open selection',
       selectionTitle: 'Referenced sections',
       selectionClose: 'Close',
@@ -83,6 +84,7 @@ window.__ModuleLoader__.load({
       hiding: 'Hiding…',
       hideFailed: 'Could not hide turns: {message}',
       restoreFailed: 'Could not restore the turn: {message}',
+      attachFailed: 'Could not attach the reference',
       hiddenBadge: 'hidden',
     };
 
@@ -105,7 +107,7 @@ window.__ModuleLoader__.load({
       selectMode: '多选章节',
       selectModeOn: '退出多选',
       selectedCount: '已选 {count} 项',
-      selectionBar: '已引用 {count} 个章节，随下一条消息一起发送',
+      selectionBar: '已附加 {count} 个章节，随下一条消息一起发送',
       openSelection: '查看引用',
       selectionTitle: '已引用章节',
       selectionClose: '关闭',
@@ -126,6 +128,7 @@ window.__ModuleLoader__.load({
       hiding: '正在隐藏…',
       hideFailed: '隐藏失败：{message}',
       restoreFailed: '恢复失败：{message}',
+      attachFailed: '附加引用失败',
       hiddenBadge: '已隐藏',
     };
 
@@ -2187,15 +2190,6 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Remove every reference block this plugin wrote from a draft.
-     * @param {string} draft - the composer text.
-     * @returns {string} the draft without reference blocks.
-     */
-    function stripReferenceBlocks(draft) {
-      return draft.replace(/<md-outline-reference>[\s\S]*?<\/md-outline-reference>\n*/g, '');
-    }
-
-    /**
      * POST one of this plugin's mutating routes.
      * @param {string} route - route path relative to the page origin.
      * @param {object} payload - JSON body.
@@ -2238,7 +2232,7 @@ window.__ModuleLoader__.load({
      * can reach the other through props. This one observable is their shared
      * owner: the outline writes selections and asks for a confirmation, and the
      * dock owns the confirmation UI because it is the only place holding both
-     * `inputActions` and the session id the Host routes need.
+     * the session id the Host routes need.
      */
     function createSelectionStore() {
       let state = { entries: [], selecting: false, sidebarOpen: false, confirmIds: null };
@@ -2427,19 +2421,16 @@ window.__ModuleLoader__.load({
          * Reference card above the composer, its detail sidebar, and the
          * hide/restore actions.
          *
-         * This slot is the only place with both `inputActions` (to write the
-         * composer) and `sessionId` (to address the Host routes), so the
-         * outline's selections are acted on from here.
+         * This slot owns `sessionId`, so the outline's selections become Host
+         * calls from here: a reference attachment, or a hide/restore.
          */
         function ReferenceDock(props) {
-          const { useSelection, useHiddenTurns, sessionId, inputActions, useInput, t } = props;
+          const { useSelection, useHiddenTurns, sessionId, t } = props;
           const selection = useSelection((s) => s);
-          const draft = useInput((s) => s.draft);
-          const phase = useInput((s) => s.phase);
           const [busy, setBusy] = useState(false);
           const [notice, setNotice] = useState(null);
-          const lastSyncedRef = useRef('');
-          const draftRef = useRef('');
+          /** The reference text already handed to the Host, to avoid re-posting it. */
+          const lastAttachedRef = useRef(null);
 
           useEffect(() => {
             if (notice === null) return undefined;
@@ -2455,34 +2446,21 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId]);
 
-          // Ticking a heading puts the reference into the draft immediately, so
-          // the next message carries it without a second click. The effect keys
-          // off the selection only: depending on the draft would re-enter every
-          // time this effect writes it, and the write would never settle. The
-          // ref holds the latest draft for the same reason.
-          draftRef.current = draft;
+          // The composer stays plain text: the reference lives in the card and
+          // the Host attaches it to the next step, so nothing is written into
+          // the draft the reader types in. Only the attachment changes here.
           useEffect(() => {
-            if (phase !== 'plain') return;
             const entries = selection.entries;
-            const previous = lastSyncedRef.current;
             const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
-            // An empty selection still needs one pass to clear, even when this
-            // mount never wrote a block itself.
-            if (next === previous && next !== '') return;
-
-            // Strip whichever reference block the draft already holds, including
-            // one written before this component remounted, so clearing the
-            // selection never leaves an orphan block in the composer.
-            const current = previous !== '' && draftRef.current.includes(previous)
-              ? draftRef.current.split(previous).join('')
-              : stripReferenceBlocks(draftRef.current);
-            const base = current;
-            const trimmed = base.trim();
-            const merged = next === '' ? trimmed : (trimmed === '' ? next : `${next}\n\n${trimmed}`);
-            lastSyncedRef.current = next;
-            draftRef.current = merged;
-            inputActions.setDraft(merged);
-          }, [selection.entries, phase, inputActions]);
+            if (next === lastAttachedRef.current) return;
+            lastAttachedRef.current = next;
+            void postRoute(SET_REFERENCE_ROUTE, { sessionId, text: next }).catch(() => {
+              // A failed attach is reported once; the card still shows what the
+              // reader picked, so the next selection change retries.
+              lastAttachedRef.current = null;
+              setNotice({ text: t('attachFailed') });
+            });
+          }, [selection.entries, sessionId, t]);
 
           const applyHidden = useCallback(async (rawTurns, route) => {
             if (busy) return;
