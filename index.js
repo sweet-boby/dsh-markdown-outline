@@ -815,6 +815,19 @@ function hiddenTurnNumbers(events) {
  * @returns {Set<number>} seqs currently on the surface.
  */
 function foldLiveSurface(events) {
+  return new Set(foldLiveSurfaceOrder(events));
+}
+
+/**
+ * Replay a session log into its surface node order.
+ *
+ * The order matters: `replace` addresses nodes by position, and the surface is
+ * not sorted by seq. A replacement carries a history instead of staying in log
+ * order, so a range built from the smallest and largest seq can point backwards.
+ * @param {ReadonlyArray<any>} events
+ * @returns {number[]} surface seqs in surface order.
+ */
+function foldLiveSurfaceOrder(events) {
   const nodes = [];
   for (const event of events) {
     const op = event?.surfaceOp;
@@ -829,7 +842,7 @@ function foldLiveSurface(events) {
     if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) continue;
     nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
   }
-  return new Set(nodes);
+  return nodes;
 }
 
 /**
@@ -852,29 +865,52 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
     'assistant/message',
     'tool/result',
   ]);
-  let currentTurn = null;
-  const seqs = [];
-  const owned = new Map();
+  // Walk the surface in its own order, not the log's: a replacement addresses
+  // positions, so a range assembled from log order can name a start that sits
+  // after its end.
+  const eventsBySeq = new Map();
+  for (const event of events) eventsBySeq.set(event.seq, event);
 
+  let currentTurn = null;
+  const turnOfSeq = new Map();
   for (const event of events) {
     if (event?.type === 'turn/start') {
       const turn = event.data?.turn;
       currentTurn = typeof turn === 'number' ? turn : null;
       continue;
     }
-    if (currentTurn === null || !selectedTurns.has(currentTurn)) continue;
+    if (currentTurn !== null) turnOfSeq.set(event.seq, currentTurn);
+  }
+
+  const seqs = [];
+  const owned = new Map();
+  const ordered = [];
+  for (const seq of foldLiveSurfaceOrder(events)) {
+    if (!liveSeqs.has(seq)) continue;
+    const event = eventsBySeq.get(seq);
+    const turn = turnOfSeq.get(seq);
+    if (event === undefined || turn === undefined) continue;
     if (!surfaceTypes.has(event.type) || event.surfaceOp === undefined) continue;
-    // A seq an earlier replacement already shadowed is no longer on the
-    // surface; offering it again fails with "not found in surface".
-    if (!liveSeqs.has(event.seq)) continue;
-    seqs.push(event.seq);
-    const list = owned.get(currentTurn);
-    if (list === undefined) owned.set(currentTurn, [event.seq]);
-    else list.push(event.seq);
+    if (!selectedTurns.has(turn)) {
+      // Any node that is not part of the selection ends the run: one
+      // replacement must never shadow content the reader did not pick.
+      ordered.push({ turn: null });
+      continue;
+    }
+    seqs.push(seq);
+    ordered.push({ turn, seq });
+    const list = owned.get(turn);
+    if (list === undefined) owned.set(turn, [seq]);
+    else list.push(seq);
   }
 
   const turns = [...owned.keys()].sort((a, b) => a - b);
-  return { seqs, turns, byTurn: turns.map((turn) => ({ turn, seqs: owned.get(turn) })) };
+  return {
+    seqs,
+    turns,
+    order: ordered,
+    byTurn: turns.map((turn) => ({ turn, seqs: owned.get(turn) })),
+  };
 }
 
 /**
@@ -888,24 +924,34 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
  *   selected turns with the seqs each owns, in log order.
  * @returns {Array<{ seqs: number[], turns: number[] }>} one run per contiguous span.
  */
-function splitIntoContiguousRuns(byTurn) {
+function splitIntoContiguousRuns(byTurn, order) {
+  // A run is a stretch of neighbouring surface positions; an unselected node
+  // ends it. Falling back to seq adjacency would mis-name both the range and
+  // its boundaries, so the caller must supply the surface order.
+  if (!Array.isArray(order)) {
+    throw new TypeError('splitIntoContiguousRuns needs the surface order');
+  }
   const runs = [];
   let current = null;
-  for (const entry of byTurn) {
-    const first = entry.seqs[0];
-    const last = entry.seqs[entry.seqs.length - 1];
-    if (first === undefined || last === undefined) continue;
-    if (current !== null && first === current.last + 1) {
-      current.seqs.push(...entry.seqs);
-      current.turns.push(entry.turn);
-      current.last = last;
+  for (const step of order) {
+    if (step.turn === null) {
+      // An unselected node between two selected ones ends the run: one
+      // replacement must never shadow content the reader did not pick.
+      current = null;
       continue;
     }
-    current = { seqs: [...entry.seqs], turns: [entry.turn], last };
-    runs.push(current);
+    if (current === null) {
+      current = { seqs: [], turns: [] };
+      runs.push(current);
+    }
+    current.seqs.push(step.seq);
+    if (!current.turns.includes(step.turn)) current.turns.push(step.turn);
   }
-  return runs.map((run) => ({ seqs: run.seqs, turns: run.turns }));
+  return runs
+    .map((run) => ({ seqs: run.seqs, turns: run.turns.sort((a, b) => a - b) }))
+    .filter((run) => run.seqs.length > 0);
 }
+
 
 /**
  * Render the hidden-turn ledger as the runtime context the model reads.
@@ -1146,7 +1192,7 @@ export function apply(ctx) {
           }
           // One replacement shadows one contiguous range, so unselected turns
           // between two selected ones need a run break rather than a wider span.
-          const runs = splitIntoContiguousRuns(picked.byTurn);
+          const runs = splitIntoContiguousRuns(picked.byTurn, picked.order);
           try {
             for (const run of runs) {
               session.append('user/message', buildHideMessage(run.turns, run.seqs.length), {
@@ -1272,6 +1318,7 @@ export const internals = {
   foldHiddenTurns,
   hiddenTurnNumbers,
   foldLiveSurface,
+  foldLiveSurfaceOrder,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,
   renderHiddenContext,

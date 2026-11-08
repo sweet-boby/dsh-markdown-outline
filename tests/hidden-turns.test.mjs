@@ -45,7 +45,7 @@ function planHide(log, picks) {
   // The route folds the log first and hands the live surface to the planner.
   const live = internals.foldLiveSurface(log)
   const picked = surfaceSeqsOfTurns(log, new Set(picks), live)
-  return { runs: splitIntoContiguousRuns(picked.byTurn), byTurn: picked.byTurn }
+  return { runs: splitIntoContiguousRuns(picked.byTurn, picked.order), byTurn: picked.byTurn }
 }
 
 test('a turn owns its prompt, its runtime context, and its reply', () => {
@@ -68,10 +68,18 @@ test('unselected turns between two selected ones are never captured', () => {
     assert.deepEqual([...captured].sort((a, b) => a - b), [...picks].sort((a, b) => a - b),
       `picking ${picks.join(',')} must capture exactly those turns`)
 
-    // Every run must be contiguous in seq space: one `replace` shadows one range.
+    // One `replace` shadows one surface range, so a run must be a stretch of
+    // neighbouring surface positions.
+    const positions = new Map(
+      internals.foldLiveSurfaceOrder(log).map((seq, index) => [seq, index]),
+    )
     for (const run of runs) {
       for (let i = 1; i < run.seqs.length; i++) {
-        assert.equal(run.seqs[i], run.seqs[i - 1] + 1, 'a run must be contiguous')
+        assert.equal(
+          positions.get(run.seqs[i]),
+          positions.get(run.seqs[i - 1]) + 1,
+          'a run must be contiguous on the surface',
+        )
       }
     }
 
@@ -94,8 +102,11 @@ test('a gap starts a new run instead of widening the span', () => {
   assert.equal(gapped.runs.length, 2, 'turn 2 sits between the picks and must not be swallowed')
   assert.deepEqual(gapped.runs.map((run) => run.turns), [[1], [3]])
 
+  // With every turn selected there is no unselected node left to break the
+  // surface, so one replacement covers the whole span.
   const all = planHide(log, [1, 2, 3, 4])
-  assert.equal(all.runs.length, 4, 'boundary events between turns break seq contiguity')
+  assert.equal(all.runs.length, 1, 'adjacent selected turns share one range')
+  assert.deepEqual(all.runs[0].turns, [1, 2, 3, 4])
 })
 
 test('the hide ledger folds hides and restores per turn', () => {
@@ -242,7 +253,7 @@ test('hiding twice never offers a seq the first hide already shadowed', () => {
   assert.ok(first.seqs.length > 0, 'the first hide finds nodes')
 
   // Apply the replacement the route would append.
-  const run = splitIntoContiguousRuns(first.byTurn)[0]
+  const run = splitIntoContiguousRuns(first.byTurn, first.order)[0]
   log.push({
     type: 'user/message',
     seq: log.length,
@@ -291,7 +302,7 @@ test('a turn hidden after being restored stays hidden without its context', () =
 
   // First hide takes turn 2 out of the model context.
   const picked = surfaceSeqsOfTurns(log, new Set([2]), live)
-  const run = splitIntoContiguousRuns(picked.byTurn)[0]
+  const run = splitIntoContiguousRuns(picked.byTurn, picked.order)[0]
   log.push({
     type: 'user/message',
     seq: log.length,
@@ -382,4 +393,69 @@ test('a turn is listed as soon as its prompt arrives', () => {
   assert.deepEqual(state.visibleTurns.map((t) => t.turn), [1], 'the prompt lists the turn')
   assert.equal(state.visibleTurns[0].prompt, 'talk to me')
   assert.deepEqual(state.visibleTurns[0].steps, [])
+})
+
+test('a run follows surface order, not seq order', () => {
+  // A real log can place a later turn's node near the front of the surface, so
+  // the lowest and highest seqs of a selection do not bound the nodes that
+  // belong together. Planning by seq then names a start that sits after its end.
+  const order = [40, 41, 42, 9, 10, 11]
+  const picked = {
+    seqs: [9, 10, 11],
+    turns: [2],
+    order: [{ turn: null }, { turn: null }, { turn: null }, { turn: 2, seq: 9 }, { turn: 2, seq: 10 }, { turn: 2, seq: 11 }],
+    byTurn: [{ turn: 2, seqs: [9, 10, 11] }],
+  }
+
+  const runs = splitIntoContiguousRuns(picked.byTurn, picked.order)
+  assert.equal(runs.length, 1)
+
+  const positions = new Map(order.map((seq, index) => [seq, index]))
+  const start = positions.get(runs[0].seqs[0])
+  const end = positions.get(runs[0].seqs[runs[0].seqs.length - 1])
+  assert.ok(start < end, `the run spans ${start}..${end} in surface order`)
+})
+
+test('a later turn sitting early on the surface does not widen an earlier run', () => {
+  // Turn 4 has one node at surface index 0 and the rest at the end. Selecting
+  // turn 2 must not produce a range reaching back to index 0.
+  const order = [107, 9, 10, 11, 108, 109, 110]
+  // The collector marks nodes it did not select as boundaries, so a later
+  // turn's node is a `null` entry here.
+  const picked = {
+    seqs: [9, 10, 11],
+    turns: [2],
+    order: [
+      { turn: null },
+      { turn: 2, seq: 9 },
+      { turn: 2, seq: 10 },
+      { turn: 2, seq: 11 },
+      { turn: null },
+      { turn: null },
+      { turn: null },
+    ],
+    byTurn: [{ turn: 2, seqs: [9, 10, 11] }],
+  }
+
+  const runs = splitIntoContiguousRuns(picked.byTurn, picked.order)
+  assert.equal(runs.length, 1)
+  assert.deepEqual(runs[0].seqs, [9, 10, 11], 'the run holds only the selected turn')
+
+  const positions = new Map(order.map((seq, index) => [seq, index]))
+  const start = positions.get(runs[0].seqs[0])
+  const end = positions.get(runs[0].seqs[runs[0].seqs.length - 1])
+  assert.ok(start < end, `the run spans ${start}..${end} in surface order`)
+})
+
+test('an unselected turn between two selected ones breaks the run', () => {
+  const log = buildSessionLog(TURNS)
+
+  // Select turns 1 and 3 while turn 2 stays visible: one replacement must not
+  // swallow turn 2.
+  const live = internals.foldLiveSurface(log)
+  const picked = surfaceSeqsOfTurns(log, new Set([1, 3]), live)
+  const runs = splitIntoContiguousRuns(picked.byTurn, picked.order)
+
+  assert.ok(runs.length >= 2, 'the gap splits the plan into separate runs')
+  assert.deepEqual([...new Set(runs.flatMap((r) => r.turns))].sort((a, b) => a - b), [1, 3])
 })
