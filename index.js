@@ -785,6 +785,34 @@ function foldHiddenTurns(events) {
 }
 
 /**
+ * Replay a session log into its current model-visible surface.
+ *
+ * This mirrors the Host's fold for the two operations a log can carry: append,
+ * and a positional replacement that shadows an inclusive range. It is local so
+ * the hide route can decide what is still addressable without importing the
+ * Host's surface module, which is not resolvable outside a running Host.
+ * @param {ReadonlyArray<any>} events
+ * @returns {Set<number>} seqs currently on the surface.
+ */
+function foldLiveSurface(events) {
+  const nodes = [];
+  for (const event of events) {
+    const op = event?.surfaceOp;
+    if (op === undefined) continue;
+    if (op === 'append') {
+      nodes.push(event.seq);
+      continue;
+    }
+    if (op === null || typeof op !== 'object' || op.op !== 'replace') continue;
+    const startIdx = nodes.indexOf(op.startSeq);
+    const endIdx = nodes.indexOf(op.endSeq);
+    if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) continue;
+    nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
+  }
+  return new Set(nodes);
+}
+
+/**
  * Collect the surface seqs belonging to selected turns.
  *
  * A turn owns every surface node at or after its `turn/start` and before the
@@ -792,10 +820,11 @@ function foldHiddenTurns(events) {
  * slicing a turn in half.
  * @param {ReadonlyArray<any>} events
  * @param {ReadonlySet<number>} selectedTurns
+ * @param {ReadonlySet<number>} liveSeqs - seqs that are still on the surface, from {@link foldLiveSurface}.
  * @returns {{ seqs: number[], turns: number[], byTurn: Array<{ turn: number, seqs: number[] }> }}
  *   shadowable seqs in log order, the turn numbers actually covered, and the seqs each owns.
  */
-function surfaceSeqsOfTurns(events, selectedTurns) {
+function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
   const surfaceTypes = new Set([
     'system/message',
     'developer/message',
@@ -815,6 +844,9 @@ function surfaceSeqsOfTurns(events, selectedTurns) {
     }
     if (currentTurn === null || !selectedTurns.has(currentTurn)) continue;
     if (!surfaceTypes.has(event.type) || event.surfaceOp === undefined) continue;
+    // A seq an earlier replacement already shadowed is no longer on the
+    // surface; offering it again fails with "not found in surface".
+    if (!liveSeqs.has(event.seq)) continue;
     seqs.push(event.seq);
     const list = owned.get(currentTurn);
     if (list === undefined) owned.set(currentTurn, [event.seq]);
@@ -1051,7 +1083,10 @@ export function apply(ctx) {
             observation = await scope.sessionQuery.observeSession(parsed.sessionId, {
               projectionMode: 'none',
             });
-            picked = surfaceSeqsOfTurns(observation.events, new Set(turns));
+            // Fold the log first: hiding twice, or hiding a turn that overlaps an
+            // earlier hide, must only offer nodes the surface still carries.
+            const live = foldLiveSurface(observation.events);
+            picked = surfaceSeqsOfTurns(observation.events, new Set(turns), live);
           } finally {
             if (observation && typeof observation[Symbol.dispose] === 'function') {
               observation[Symbol.dispose]();
@@ -1187,6 +1222,7 @@ export const internals = {
   searchBlockBody,
   searchSessionAssistantEvents,
   foldHiddenTurns,
+  foldLiveSurface,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,
   renderHiddenContext,

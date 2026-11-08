@@ -16,6 +16,7 @@ import {
 
 const {
   foldHiddenTurns,
+  foldLiveSurface,
   surfaceSeqsOfTurns,
   splitIntoContiguousRuns,
   mdOutlineProjectionDefinition,
@@ -40,13 +41,16 @@ const TURNS = [
  * @returns {{ runs: Array<{ seqs: number[], turns: number[] }>, byTurn: object[] }} the plan.
  */
 function planHide(log, picks) {
-  const picked = surfaceSeqsOfTurns(log, new Set(picks))
+  // The route folds the log first and hands the live surface to the planner.
+  const live = internals.foldLiveSurface(log)
+  const picked = surfaceSeqsOfTurns(log, new Set(picks), live)
   return { runs: splitIntoContiguousRuns(picked.byTurn), byTurn: picked.byTurn }
 }
 
 test('a turn owns its prompt, its runtime context, and its reply', () => {
   const log = buildSessionLog(TURNS)
-  const picked = surfaceSeqsOfTurns(log, new Set([2]))
+  const live = internals.foldLiveSurface(log)
+  const picked = surfaceSeqsOfTurns(log, new Set([2]), live)
 
   assert.deepEqual(picked.turns, [2])
   assert.equal(picked.byTurn.length, 1)
@@ -214,4 +218,56 @@ test('hide and restore messages describe whole turns', () => {
 
   const restore = buildRestoreMessage([2, 3]).content[0].text
   assert.match(restore, /restored turns 2, 3/)
+})
+
+test('hiding twice never offers a seq the first hide already shadowed', () => {
+  const log = buildSessionLog(TURNS)
+
+  // First hide: turn 2.
+  const firstLive = internals.foldLiveSurface(log)
+  const first = surfaceSeqsOfTurns(log, new Set([2]), firstLive)
+  assert.ok(first.seqs.length > 0, 'the first hide finds nodes')
+
+  // Apply the replacement the route would append.
+  const run = splitIntoContiguousRuns(first.byTurn)[0]
+  log.push({
+    type: 'user/message',
+    seq: log.length,
+    time: 0,
+    data: { id: 'hide1', role: 'user', content: [{ type: 'text', text: '<hidden>' }], source: { kind: 'hidden-turns' } },
+    surfaceOp: { op: 'replace', startSeq: run.seqs[0], endSeq: run.seqs[run.seqs.length - 1] },
+    sourceEventSeqs: run.seqs,
+  })
+
+  // Second hide of the same turn: its nodes are gone, so nothing is offered.
+  const secondLive = internals.foldLiveSurface(log)
+  const second = surfaceSeqsOfTurns(log, new Set([2]), secondLive)
+  assert.deepEqual(second.seqs, [], 'an already hidden turn has nothing left to shadow')
+
+  // Every seq it would offer for another turn is still on the surface.
+  const third = surfaceSeqsOfTurns(log, new Set([1, 3]), secondLive)
+  for (const seq of third.seqs) {
+    assert.ok(secondLive.has(seq), 'offered seqs are on the live surface')
+  }
+  assert.ok(third.seqs.length > 0, 'unhidden turns stay hideable')
+})
+
+test('the live surface drops the replacement range and keeps its replacement', () => {
+  const log = buildSessionLog([TURNS[0]])
+  const before = internals.foldLiveSurface(log)
+  assert.ok(before.size >= 2, 'the turn is on the surface')
+
+  const seqs = [...before]
+  log.push({
+    type: 'user/message',
+    seq: log.length,
+    time: 0,
+    data: { id: 'h', role: 'user', content: [{ type: 'text', text: '<hidden>' }], source: { kind: 'hidden-turns' } },
+    surfaceOp: { op: 'replace', startSeq: seqs[0], endSeq: seqs[seqs.length - 1] },
+    sourceEventSeqs: seqs,
+  })
+
+  const after = internals.foldLiveSurface(log)
+  for (const seq of seqs) assert.ok(!after.has(seq), 'shadowed nodes leave the surface')
+  assert.ok(after.has(log.length - 1), 'the replacement itself is on the surface')
 })
