@@ -2174,20 +2174,25 @@ window.__ModuleLoader__.load({
       // This text lands in the composer, so it reads as a compact citation
       // rather than a Markdown document: the reader can still see and edit it,
       // and the model receives the same content it always did.
+      // This is the reader quoting their own earlier conversation, so it reads
+      // as quotable prose rather than a machine tag the model would treat as
+      // injected context.
       const blocks = entries.map((entry) => {
         const meta = [`第 ${entry.turn} 轮`];
         if (entry.prompt) meta.push(entry.prompt);
-        const head = `【引用】${entry.heading}（${meta.join(' · ')}）`;
-        const body = entry.body
-          ? entry.body.replace(/(^|\s)@(?=\S)/g, '$1@ ').trim()
-          : '';
-        return body === '' ? head : `${head}\n${body}`;
+        const quoted = String(entry.body ?? '')
+          .replace(/(^|\s)@(?=\S)/g, '$1@ ')
+          .trim()
+          .split(/\r?\n/)
+          .map((line) => (line.trim() === '' ? '>' : `> ${line}`))
+          .join('\n');
+        return `> **${entry.heading}**（${meta.join(' · ')}）${quoted === '' ? '' : `\n>\n${quoted}`}`;
       });
 
-      let text = `<md-outline-reference>\n${blocks.join('\n\n')}\n</md-outline-reference>`;
+      let text = [`以下是对话中的引用片段：`, '', blocks.join('\n>\n')].join('\n');
       let truncated = false;
       if (text.length > MAX_REFERENCE_CHARS) {
-        text = `${text.slice(0, MAX_REFERENCE_CHARS)}\n…（内容过长，已截断）\n</md-outline-reference>`;
+        text = `${text.slice(0, MAX_REFERENCE_CHARS)}\n\n…（内容过长，已截断）`;
         truncated = true;
       }
       return { text, truncated };
@@ -2200,7 +2205,7 @@ window.__ModuleLoader__.load({
      */
     function stripReferenceBlocks(draft) {
       return String(draft)
-        .replace(/<md-outline-reference>[\s\S]*?<\/md-outline-reference>\n*/g, '')
+        .replace(/以下是对话中的引用片段：\n[\s\S]*?(?=\n\n(?![>])|$)/g, '')
         .trim();
     }
 

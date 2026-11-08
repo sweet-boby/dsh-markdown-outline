@@ -236,7 +236,7 @@ test('confirming a reference writes it into the draft', () => {
   const { draft, writes } = renderDock({ attached: [ENTRY] })
 
   assert.equal(writes.length, 1, 'the reference is written once')
-  assert.match(draft(), /<md-outline-reference>/)
+  assert.match(draft(), /以下是对话中的引用片段/)
   assert.match(draft(), /第一层：中文连接词规范化/)
   assert.match(draft(), /第 22 轮/)
   assert.match(draft(), /\/articles\/search\?keyword=水泥和水果/)
@@ -245,10 +245,10 @@ test('confirming a reference writes it into the draft', () => {
 test('the reference keeps the words the reader already typed', () => {
   const { draft } = renderDock({ attached: [ENTRY], draft: '我发给了你啥' })
 
-  assert.match(draft(), /<md-outline-reference>/, 'the block is present')
+  assert.match(draft(), /以下是对话中的引用片段/, 'the quote block is present')
   assert.match(draft(), /我发给了你啥/, 'the typed text survives')
   assert.ok(
-    draft().indexOf('</md-outline-reference>') < draft().indexOf('我发给了你啥'),
+    draft().indexOf('/articles/search') < draft().indexOf('我发给了你啥'),
     'the reference sits above the typed text',
   )
 })
@@ -261,7 +261,7 @@ test('an empty attachment leaves the draft alone', () => {
 
 test('detaching removes the block and keeps the typed text', () => {
   const first = renderDock({ attached: [ENTRY], draft: '我发给了你啥' })
-  assert.match(first.draft(), /<md-outline-reference>/)
+  assert.match(first.draft(), /以下是对话中的引用片段/)
 
   // Detach in the same mount: the card goes and the block leaves the draft.
   const second = loadClient()
@@ -289,7 +289,7 @@ test('detaching removes the block and keeps the typed text', () => {
     t: (key) => key,
   })
 
-  assert.ok(!current.includes('<md-outline-reference>'), 'the block is gone')
+  assert.ok(!current.includes('以下是对话中的引用片段'), 'the block is gone')
   assert.match(current, /我发给了你啥/, 'the typed text stays')
 })
 
