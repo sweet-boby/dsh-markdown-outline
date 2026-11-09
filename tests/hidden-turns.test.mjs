@@ -499,3 +499,97 @@ test('a system prompt is never part of a hide range', () => {
     'turn 2 is still planned',
   )
 })
+
+test('extractStepSectionByIndex extracts non-zero ordinal headings, formatted headings, and ignores code comments', () => {
+  const { extractStepSectionByIndex } = internals
+  const markdown = [
+    '## 1. **First** `heading`',
+    'Body one.',
+    '```bash',
+    '# comment inside fence must not end section',
+    'echo 1',
+    '```',
+    'After fence one.',
+    '## 2. [Second](https://example.com) heading',
+    'Body two line 1.',
+    '### 2.1 Nested subheading',
+    'Nested body.',
+    '## 3. Third heading',
+    'Body three.',
+  ].join('\n')
+
+  const sec0 = extractStepSectionByIndex([markdown], 0)
+  assert.ok(sec0 !== null)
+  assert.equal(sec0.heading, '1. First heading')
+  assert.match(sec0.body, /# comment inside fence must not end section/)
+  assert.match(sec0.body, /After fence one\./)
+  assert.ok(!sec0.body.includes('Body two line 1'))
+
+  const sec1 = extractStepSectionByIndex([markdown], 1)
+  assert.ok(sec1 !== null)
+  assert.equal(sec1.heading, '2. Second heading')
+  assert.match(sec1.body, /Body two line 1\./)
+  assert.match(sec1.body, /### 2\.1 Nested subheading/)
+  assert.match(sec1.body, /Nested body\./)
+  assert.ok(!sec1.body.includes('Body three'))
+
+  const sec2 = extractStepSectionByIndex([markdown], 2)
+  assert.ok(sec2 !== null)
+  assert.equal(sec2.heading, '2.1 Nested subheading')
+  assert.equal(sec2.body, 'Nested body.')
+})
+
+test('dsh-outline mention URI round-trips and expands in prepareOutlineReferencedMessages', () => {
+  const {
+    formatOutlineReferenceMention,
+    parseOutlineReferenceText,
+    prepareOutlineReferencedMessages,
+  } = internals
+
+  const log = buildSessionLog([
+    {
+      turn: 1,
+      prompt: 'design search',
+      reply: '## 第一层：中文连接词规范化\n\n水泥和水果 → 水泥 水果\n\n## 第二层：严格 OR 搜索\n\n使用 OR 查询。',
+    },
+  ])
+
+  const mention = formatOutlineReferenceMention({
+    turn: 1,
+    step: 1,
+    indexInStep: 1,
+    heading: '第二层：严格 OR 搜索',
+    label: '#1 · 第二层：严格 OR 搜索',
+  })
+
+  const parsed = parseOutlineReferenceText('请帮我看看 ' + mention + ' 的逻辑')
+  assert.equal(parsed.text, '请帮我看看 @#1 · 第二层：严格 OR 搜索 的逻辑')
+  assert.equal(parsed.references.length, 1)
+  assert.equal(parsed.references[0].turn, 1)
+  assert.equal(parsed.references[0].indexInStep, 1)
+
+  const expanded = prepareOutlineReferencedMessages(log, [
+    {
+      id: 'u2',
+      role: 'user',
+      content: [{ type: 'text', text: '请帮我看看 ' + mention + ' 的逻辑' }],
+      source: { kind: 'user' },
+    },
+  ])
+
+  assert.equal(expanded.length, 2, 'appends one recall context message after the user message')
+  assert.equal(expanded[1].source.kind, 'session-reference')
+  assert.equal(expanded[1].source.form, 'recall')
+  assert.match(expanded[1].content[0].text, /第二层：严格 OR 搜索/)
+  assert.match(expanded[1].content[0].text, /使用 OR 查询。/)
+  assert.ok(!expanded[1].content[0].text.includes('水泥和水果'), 'only the selected section is injected')
+})
+
+test('restoring a hidden turn removes it from renderHiddenContext so the model can see it again', () => {
+  const log = buildSessionLog(TURNS)
+  appendHideRecord(log, [{ turn: 2, seqs: [9, 10, 11] }], HIDE_RECORD)
+  assert.match(renderHiddenContext(foldHiddenTurns(log)), /2/)
+
+  appendRestoreRecord(log, [2], RESTORE_RECORD)
+  assert.equal(renderHiddenContext(foldHiddenTurns(log)), '')
+})

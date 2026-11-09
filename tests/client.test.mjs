@@ -349,6 +349,79 @@ test('a turn whose reply failed is still selectable from its prompt', () => {
   assert.equal(entry.body, '行，你根据大纲写一份完整的飞书文档吧', 'the prompt stands in for the missing reply')
   assert.equal(entry.id, 't61:headless')
 
-  // A turn with neither reply nor prompt contributes nothing.
+  // A turn with neither reply nor prompt contributes nothing unless allowEmpty is set.
   assert.equal(build({ turn: 61, prompt: '' }, []), null)
+  const emptyAllowed = build({ turn: 61, prompt: '' }, [], { allowEmpty: true })
+  assert.ok(emptyAllowed !== null, 'allowEmpty creates a selectable entry for image-only or unloaded turns')
+  assert.equal(emptyAllowed.id, 't61:headless')
+})
+
+test('client collectSectionBody extracts non-zero ordinal headings and formatted headings', () => {
+  const { internals } = loadClient()
+  const { collectSectionBody } = internals
+  const md = [
+    '### 1. **First** `section`',
+    'First body',
+    '```sh',
+    '# shell comment inside code block',
+    '```',
+    'Still first body',
+    '### 2. Second section',
+    'Second body',
+  ].join('\n')
+
+  assert.equal(
+    collectSectionBody([md], '1. First section', 0),
+    'First body\n```sh\n# shell comment inside code block\n```\nStill first body',
+  )
+  assert.equal(
+    collectSectionBody([md], '2. Second section', 1),
+    'Second body',
+  )
+})
+
+test('confirming a reference inserts atomic ReferenceChipNode via slash/input-insert-reference when session binding is live', () => {
+  const client = loadClient()
+  const insertedRefs = []
+  client.setBinding((sessionId) => ({
+    sessionId,
+    ctx: {
+      bail: (_target, eventName, payload) => {
+        if (eventName === 'slash/input-insert-reference') {
+          insertedRefs.push(payload)
+          return true
+        }
+        return undefined
+      },
+    },
+  }))
+
+  const dock = client.registered.get('md-outline-reference')
+  const writes = []
+  dock({
+    useSelection: (selector) => selector({
+      entries: [],
+      attached: [ENTRY],
+      selecting: false,
+      sidebarOpen: false,
+      confirmIds: null,
+    }),
+    useHiddenTurns: (selector) => selector({ bySession: {} }),
+    useInput: (selector) => selector({ draft: 'hello', phase: 'plain' }),
+    sessionId: 'session-1',
+    inputActions: {
+      captureInsertion: () => ({ start: 5, end: 5, draftRev: 1 }),
+      insertText: () => true,
+      setDraft: (text) => { writes.push(text) },
+      persistDraft: () => {},
+    },
+    t: (key) => key,
+  })
+
+  assert.equal(insertedRefs.length, 1, 'inserts one atomic chip via slash/input-insert-reference')
+  assert.equal(insertedRefs[0].reference.source, 'md-outline')
+  assert.equal(insertedRefs[0].reference.appearance, 'file')
+  assert.match(insertedRefs[0].reference.label, /#22 · 第一层：中文连接词规范化/)
+  assert.match(insertedRefs[0].reference.clipboardText, /^@\[#22 · 第一层：中文连接词规范化\]\(dsh-outline:/)
+  assert.equal(writes.length, 0, 'does not dump raw Markdown into setDraft when atomic chip insertion succeeds')
 })

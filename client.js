@@ -30,6 +30,8 @@ window.__ModuleLoader__.load({
     const STORAGE_OPEN_KEY = 'dsh.mdOutline.open';
     const STORAGE_WIDTH_KEY = 'dsh.mdOutline.width';
     const SEARCH_ROUTE = 'md-outline/search';
+    const SECTION_ROUTE = 'md-outline/section';
+    const OUTLINE_REFERENCE_SCHEME = 'dsh-outline:';
     const HIDE_ROUTE = 'md-outline/hide';
     const RESTORE_ROUTE = 'md-outline/restore';
     const DEFAULT_WIDTH = 252;
@@ -470,6 +472,39 @@ window.__ModuleLoader__.load({
 .dsh-mdo-check[data-checked="true"] {
   border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
   background: var(--dsw-alias-brand-primary, var(--dsw-alias-label-primary));
+}
+
+/* --- inline sent-message chip -------------------------------------------- */
+
+.dsh-mdo-inline-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 260px;
+  padding: 1px 7px;
+  margin: 0 2px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-layer-1));
+  color: var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary));
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  vertical-align: baseline;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.dsh-mdo-inline-chip:hover {
+  background: var(--dsw-alias-interactive-bg-hover, var(--dsw-alias-bg-layer-2));
+  border-color: var(--dsw-alias-brand-primary, var(--dsw-alias-border-l2));
+}
+
+.dsh-mdo-inline-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- reference card above the composer ----------------------------------- */
@@ -2112,47 +2147,191 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Collect the reply text under one heading, from its own line to the next
-     * heading at the same or a shallower depth.
-     * @param {ReadonlyArray<string>} texts - the step's Markdown text blocks.
-     * @param {string} headingText - the heading this section starts at.
-     * @param {number} headingIndex - that heading's ordinal within the step.
+     * Encode/decode base64url in both browser and Node test environments.
+     */
+    function toBase64Url(str) {
+      if (typeof Buffer !== 'undefined') {
+        return Buffer.from(str, 'utf8').toString('base64url');
+      }
+      const bytes = new TextEncoder().encode(str);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function fromBase64Url(b64url) {
+      if (typeof Buffer !== 'undefined') {
+        return Buffer.from(b64url, 'base64url').toString('utf8');
+      }
+      const padded = b64url.replace(/-/g, '+').replace(/_/g, '/');
+      const binary = atob(padded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new TextDecoder().decode(bytes);
+    }
+
+    function encodeOutlineReferenceUri(ref) {
+      const payload = {
+        t: Number(ref.turn) || 0,
+        s: typeof ref.step === 'number' ? ref.step : -1,
+        i: typeof ref.indexInStep === 'number' ? ref.indexInStep : -1,
+        ...(typeof ref.heading === 'string' && ref.heading !== '' ? { h: ref.heading.slice(0, 80) } : {}),
+      };
+      return `${OUTLINE_REFERENCE_SCHEME}${toBase64Url(JSON.stringify(payload))}`;
+    }
+
+    function decodeOutlineReferenceUri(uri) {
+      if (typeof uri !== 'string' || !uri.startsWith(OUTLINE_REFERENCE_SCHEME)) return null;
+      const raw = uri.slice(OUTLINE_REFERENCE_SCHEME.length);
+      if (!/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+      try {
+        const parsed = JSON.parse(fromBase64Url(raw));
+        if (typeof parsed !== 'object' || parsed === null || typeof parsed.t !== 'number') return null;
+        return {
+          turn: parsed.t,
+          step: typeof parsed.s === 'number' ? parsed.s : -1,
+          indexInStep: typeof parsed.i === 'number' ? parsed.i : -1,
+          heading: typeof parsed.h === 'string' ? parsed.h : '',
+        };
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    function formatOutlineReferenceMention(entry) {
+      const label = entry.label || (entry.heading ? `#${entry.turn} · ${entry.heading}` : `#${entry.turn}`);
+      const escaped = String(label).replace(/[\\\]]/g, (m) => `\\${m}`);
+      const uri = entry.uri || encodeOutlineReferenceUri(entry);
+      return `@[${escaped}](${uri})`;
+    }
+
+    /**
+     * Collect the reply Markdown body under one heading at `headingIndex`
+     * within the step's text blocks, stopping before the next heading at the
+     * same or shallower depth. Respects fenced code blocks and both ATX and
+     * Setext headings.
+     *
+     * @param {ReadonlyArray<string>} texts - the step's Markdown text blocks (or lines).
+     * @param {string} headingText - cleaned heading title (used as fallback).
+     * @param {number} headingIndex - 0-based heading ordinal within the step.
      * @returns {string}
      */
     function collectSectionBody(texts, headingText, headingIndex) {
-      const lines = texts.join('\n').split(/\r?\n/);
-      const out = [];
-      let seen = -1;
+      if (!Array.isArray(texts) || texts.length === 0) return '';
+      const fullText = texts.join('\n');
+      const lines = fullText.split(/\r?\n/);
+      let headingOrdinal = -1;
       let started = false;
-      let startDepth = 0;
-      let fence = '';
-      for (const line of lines) {
-        const atx = /^ {0,3}(#{1,6})[ \t]+(.*)$/.exec(line);
-        if (atx !== null) {
-          const depth = atx[1].length;
-          const title = atx[2].replace(/[ \t]+#+[ \t]*$/, '').trim();
-          if (!started) {
-            if (title !== headingText) continue;
-            seen += 1;
-            if (seen !== headingIndex) continue;
-            started = true;
-            startDepth = depth;
-            continue;
+      let startDepth = 1;
+      let fenceChar = '';
+      let fenceLen = 0;
+      let paragraphLines = [];
+      let paragraphRawLines = [];
+      const out = [];
+
+      const flushParagraph = () => {
+        if (started && paragraphRawLines.length > 0) {
+          for (const raw of paragraphRawLines) out.push(raw);
+        }
+        paragraphLines = [];
+        paragraphRawLines = [];
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] ?? '';
+
+        if (fenceChar !== '') {
+          const closeMatch = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+          if (
+            closeMatch !== null &&
+            closeMatch[1][0] === fenceChar &&
+            closeMatch[1].length >= fenceLen
+          ) {
+            fenceChar = '';
+            fenceLen = 0;
           }
-          if (depth <= startDepth) break;
-          out.push(line);
+          if (started) out.push(line);
           continue;
         }
-        if (started) {
-          const openFence = /^ {0,3}(`{3,}|~{3,})/.exec(line);
-          if (fence === '') {
-            if (openFence !== null) fence = openFence[1][0];
-          } else if (openFence !== null && openFence[1][0] === fence) {
-            fence = '';
+
+        const openFence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+        if (
+          openFence !== null &&
+          !(openFence[1][0] === '`' && openFence[2].includes('`'))
+        ) {
+          flushParagraph();
+          fenceChar = openFence[1][0];
+          fenceLen = openFence[1].length;
+          if (started) out.push(line);
+          continue;
+        }
+
+        const atx = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/.exec(line);
+        if (atx !== null) {
+          const afterHashes = line.replace(/^ {0,3}#{1,6}/, '');
+          if (afterHashes === '' || /^[ \t]/.test(afterHashes)) {
+            flushParagraph();
+            const rawBody = (atx[2] ?? '').replace(/^#+[ \t]*$/, '');
+            const cleaned = cleanHeadingText(rawBody);
+            if (cleaned !== '') {
+              const depth = atx[1].length;
+              headingOrdinal += 1;
+              if (!started) {
+                const indexMatches =
+                  typeof headingIndex === 'number' && headingIndex >= 0
+                    ? headingOrdinal === headingIndex
+                    : cleaned === headingText;
+                if (indexMatches) {
+                  started = true;
+                  startDepth = depth;
+                }
+              } else if (depth <= startDepth) {
+                break;
+              } else {
+                out.push(line);
+              }
+              continue;
+            }
           }
-          out.push(line);
+        }
+
+        if (paragraphLines.length > 0) {
+          const setext = /^ {0,3}(=+|-+)[ \t]*$/.exec(line);
+          if (setext !== null) {
+            const depth = setext[1][0] === '=' ? 1 : 2;
+            const cleaned = cleanHeadingText(paragraphLines.join(' '));
+            if (cleaned !== '') {
+              paragraphLines = [];
+              paragraphRawLines = [];
+              headingOrdinal += 1;
+              if (!started) {
+                const indexMatches =
+                  typeof headingIndex === 'number' && headingIndex >= 0
+                    ? headingOrdinal === headingIndex
+                    : cleaned === headingText;
+                if (indexMatches) {
+                  started = true;
+                  startDepth = depth;
+                }
+              } else if (depth <= startDepth) {
+                break;
+              } else {
+                out.push(line);
+              }
+              continue;
+            }
+          }
+        }
+
+        if (isNonParagraphLine(line)) {
+          flushParagraph();
+          if (started) out.push(line);
+        } else {
+          paragraphLines.push(line.trim());
+          paragraphRawLines.push(line);
         }
       }
+      flushParagraph();
       return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
     }
 
@@ -2170,17 +2349,26 @@ window.__ModuleLoader__.load({
       );
       const text = item.text;
       let body = '';
-      const blockText = step?.texts?.[item.blockIndex ?? 0];
-      if (typeof blockText === 'string') {
-        body = collectSectionBody(blockText.split('\n'), text, item.indexInStep ?? 0);
+      if (Array.isArray(step?.texts) && step.texts.length > 0) {
+        body = collectSectionBody(step.texts, text, item.indexInStep ?? 0);
       }
+      const uri = encodeOutlineReferenceUri({
+        turn: group.turn,
+        step: item.step,
+        indexInStep: item.indexInStep ?? 0,
+        heading: text,
+      });
+      const label = `#${group.turn} · ${text}`;
       return {
         id: item.id,
         kind: 'section',
         turn: group.turn,
         step: item.step,
+        indexInStep: item.indexInStep ?? 0,
         prompt: group.prompt ?? '',
         heading: text,
+        label,
+        uri,
         path: [...(path ?? [])],
         depth: item.depth,
         body,
@@ -2189,33 +2377,41 @@ window.__ModuleLoader__.load({
 
     /**
      * Build the selection a headingless turn contributes.
-     *
-     * Such a turn has no rows to tick, but the reader still needs to select it —
-     * to quote the reply or to hide the turn — so its whole reply stands in for
-     * one section.
+     * Even when a turn is unloaded or has an image-only prompt with no loaded text,
+     * it always returns a valid selection entry so every turn in the outline can
+     * be ticked, quoted, or hidden.
      * @param {object} group - the turn's outline group.
      * @param {ReadonlyArray<object>} allSteps - loaded steps carrying block text.
-     * @returns {object | null} the selection, or null when the turn has no text.
+     * @param {{ allowEmpty?: boolean }} [options]
+     * @returns {object | null}
      */
-    function buildHeadlessSelection(group, allSteps) {
+    function buildHeadlessSelection(group, allSteps, options) {
+      if (!group || typeof group.turn !== 'number') return null;
       const steps = (allSteps ?? []).filter((candidate) => candidate.turn === group.turn);
       let body = steps
         .flatMap((step) => step.texts ?? [])
         .join('\n')
         .trim();
-      // A turn whose reply failed carries only its prompt. That is still a turn
-      // the reader can see and may want to hide, so the prompt stands in for the
-      // content instead of leaving the checkbox dead.
       if (body === '') body = (group.prompt ?? '').trim();
-      if (body === '') return null;
-      const heading = group.prompt === '' ? `第 ${group.turn} 轮` : group.prompt;
+      if (body === '' && options?.allowEmpty !== true) return null;
+      const heading = (group.prompt ?? '').trim() === '' ? `第 ${group.turn} 轮` : group.prompt.trim();
+      const uri = encodeOutlineReferenceUri({
+        turn: group.turn,
+        step: -1,
+        indexInStep: -1,
+        heading,
+      });
+      const label = `#${group.turn} · ${heading}`;
       return {
         id: `t${group.turn}:headless`,
         kind: 'section',
         turn: group.turn,
-        step: 0,
+        step: -1,
+        indexInStep: -1,
         prompt: group.prompt ?? '',
         heading,
+        label,
+        uri,
         path: [],
         depth: 1,
         body,
@@ -2223,19 +2419,12 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Render the selected sections as the reference block inserted into the composer.
-     * File references in `@path` form are spelled `@ path` so the composer's
-     * mention trigger does not rewrite them.
-     * @param {ReadonlyArray<object>} entries - selection entries in selection order.
+     * Render the selected sections as the fallback reference block when atomic
+     * chip insertion is unavailable (e.g., in headless unit-test harnesses).
+     * @param {ReadonlyArray<object>} entries
      * @returns {{ text: string, truncated: boolean }}
      */
     function buildReferenceText(entries) {
-      // This text lands in the composer, so it reads as a compact citation
-      // rather than a Markdown document: the reader can still see and edit it,
-      // and the model receives the same content it always did.
-      // This is the reader quoting their own earlier conversation, so it reads
-      // as quotable prose rather than a machine tag the model would treat as
-      // injected context.
       const blocks = entries.map((entry) => {
         const meta = [`第 ${entry.turn} 轮`];
         if (entry.prompt) meta.push(entry.prompt);
@@ -2258,21 +2447,19 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Remove every reference block from a draft.
-     * @param {string} draft - composer text.
-     * @returns {string} the draft without reference blocks.
+     * Remove every reference block or inline outline mention from a draft.
+     * @param {string} draft
+     * @returns {string}
      */
     function stripReferenceBlocks(draft) {
       return String(draft)
         .replace(/以下是对话中的引用片段：\n[\s\S]*?(?=\n\n(?![>])|$)/g, '')
+        .replace(/@\[(?:\\.|[^\\\]])*\]\(dsh-outline:[A-Za-z0-9_-]+\)[ \t]*/gu, '')
         .trim();
     }
 
     /**
      * POST one of this plugin's mutating routes.
-     * @param {string} route - route path relative to the page origin.
-     * @param {object} payload - JSON body.
-     * @returns {Promise<{ ok: boolean, body: object }>}
      */
     async function postRoute(route, payload) {
       const resp = await fetch(route, {
@@ -2284,17 +2471,47 @@ window.__ModuleLoader__.load({
       try {
         body = await resp.json();
       } catch (error) {
-        // A non-JSON body is reported through the status alone.
         void error;
       }
       return { ok: resp.ok, body };
     }
 
     /**
-     * Selection state machine, exposed for the unit tests that assert the
-     * confirm gate. This is the only consumer besides `apply`.
+     * Fetch one section's full Markdown body from the Host when its turn is
+     * outside the currently loaded browser window.
      */
-    const selectionInternals = { createSelectionStore, buildHeadlessSelection };
+    async function fetchRemoteSection(sessionId, target) {
+      if (!sessionId || !target) return null;
+      try {
+        const params = new URLSearchParams({ sessionId });
+        if (target.uri) {
+          params.set('uri', target.uri);
+        } else {
+          params.set('turn', String(target.turn ?? 0));
+          params.set('step', String(target.step ?? -1));
+          params.set('indexInStep', String(target.indexInStep ?? -1));
+          if (target.heading) params.set('heading', target.heading);
+        }
+        const resp = await fetch(`${SECTION_ROUTE}?${params.toString()}`, {
+          headers: { accept: 'application/json' },
+        });
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return data?.section ?? null;
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    const selectionInternals = {
+      createSelectionStore,
+      buildHeadlessSelection,
+      buildSectionSelection,
+      collectSectionBody,
+      encodeOutlineReferenceUri,
+      decodeOutlineReferenceUri,
+      formatOutlineReferenceMention,
+    };
 
     const EMPTY_BRIDGE = Object.freeze({
       active: false,
@@ -2308,28 +2525,13 @@ window.__ModuleLoader__.load({
       loadThrough: undefined,
     });
 
-    /**
-     * Cross-slot store for the selection, the reference card, and the Hide
-     * action's confirmation.
-     *
-     * The outline lives in the header slot, the card above the composer, and
-     * the composer itself is reachable only from the dock slot, so neither end
-     * can reach the other through props. This one observable is their shared
-     * owner: the outline writes selections and asks for a confirmation, and the
-     * dock owns the confirmation UI because it is the only place holding both
-     * the session id the Host routes need.
-     */
     function createSelectionStore() {
-      // `entries` is the live tick list; `attached` is what the reader confirmed
-      // and what the composer card shows. Confirming copies one to the other so
-      // further ticking never silently changes what will be sent.
       let state = {
         entries: [],
         attached: [],
         selecting: false,
         sidebarOpen: false,
         confirmIds: null,
-        /** The section opened from a composer chip, shown in the sidebar. */
         preview: null,
       };
       const listeners = new Set();
@@ -2349,12 +2551,20 @@ window.__ModuleLoader__.load({
         },
         read,
         setSelecting: (selecting) => write({ ...state, selecting }),
-        setSidebarOpen: (sidebarOpen) => write({ ...state, sidebarOpen }),
+        setSidebarOpen: (sidebarOpen) => write({ ...state, sidebarOpen, ...(sidebarOpen ? {} : { preview: null }) }),
         toggleEntry: (entry) => {
           const exists = state.entries.some((it) => it.id === entry.id);
           write({
             ...state,
             entries: exists ? state.entries.filter((it) => it.id !== entry.id) : [...state.entries, entry],
+          });
+        },
+        updateEntryBody: (id, body) => {
+          write({
+            ...state,
+            entries: state.entries.map((it) => (it.id === id ? { ...it, body } : it)),
+            attached: state.attached.map((it) => (it.id === id ? { ...it, body } : it)),
+            preview: state.preview?.id === id ? { ...state.preview, body } : state.preview,
           });
         },
         removeEntry: (id) => write({ ...state, entries: state.entries.filter((it) => it.id !== id) }),
@@ -2363,18 +2573,16 @@ window.__ModuleLoader__.load({
           attached: state.attached.filter((it) => it.id !== id),
         }),
         clearEntries: () => write({ ...state, entries: [], selecting: false }),
-        /** Confirm the live selection as the reference that travels with the message. */
-        attachEntries: () => write({ ...state, attached: [...state.entries], selecting: false, sidebarOpen: false }),
-        /** Show one referenced section's detail, opened from its composer chip. */
+        attachEntries: () => write({ ...state, attached: [...state.entries], entries: [], selecting: false, sidebarOpen: false, preview: null }),
         openPreview: (preview) => write({ ...state, preview, sidebarOpen: true }),
         closePreview: () => write({ ...state, preview: null, sidebarOpen: false }),
-        /** Drop the attached reference without touching the live selection. */
-        detach: () => write({ ...state, attached: [], sidebarOpen: false }),
+        detach: () => write({ ...state, attached: [], sidebarOpen: false, preview: null }),
         requestHide: (ids) => write({ ...state, confirmIds: ids }),
         cancelHide: () => write({ ...state, confirmIds: null }),
         finishHide: (ids) => write({
           ...state,
           confirmIds: null,
+          selecting: false,
           entries: state.entries.filter((it) => !ids.has(it.id)),
         }),
         reset: () => write({
@@ -2388,7 +2596,6 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** Hidden-turn state per Session, written by the card and read by the outline. */
     function createHiddenStore() {
       let state = { bySession: {} };
       const listeners = new Set();
@@ -2418,14 +2625,34 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /**
-     * Restore action published by the composer dock, which is the only slot
-     * holding the session id the Host routes need. The outline calls it without
-     * carrying a second copy of the transport, and a missing function simply
-     * leaves the restore buttons disabled.
-     */
     const restoreActionRef = { current: null };
 
+    /**
+     * Rule that turns `@[label](dsh-outline:...)` mentions inside sent user
+     * chat bubbles into clickable inline reference chips.
+     */
+    const outlineUserTextRule = {
+      id: 'md-outline',
+      order: 15,
+      match(text, from) {
+        const wire = /@\[((?:\\.|[^\\\]])*)\]\((dsh-outline:[A-Za-z0-9_-]+)\)/uy;
+        for (let start = text.indexOf('@[', from); start >= 0; start = text.indexOf('@[', start + 1)) {
+          wire.lastIndex = start;
+          const m = wire.exec(text);
+          if (m !== null) {
+            const label = String(m[1] ?? '').replace(/\\(.)/gu, '$1');
+            const uri = String(m[2] ?? '');
+            return {
+              id: 'md-outline',
+              start,
+              end: start + m[0].length,
+              data: { label, uri },
+            };
+          }
+        }
+        return undefined;
+      },
+    };
 
     return {
       name: 'md-outline',
@@ -2460,9 +2687,175 @@ window.__ModuleLoader__.load({
         const selectionStore = createSelectionStore();
         const hiddenStore = createHiddenStore();
 
-        // One plugin-owned stylesheet carries the transcript rule for the whole
-        // Client run. Writing it here rather than inside a component keeps the
-        // rule in place across session switches and component remounts.
+        /**
+         * Open the detail drawer for a `dsh-outline:` reference (from either a
+         * composer chip or a sent message bubble chip). Resolves from loaded
+         * steps first, then falls back to the Host full-log section route.
+         */
+        const openOutlineReference = (sessionId, uri, fallbackLabel) => {
+          const decoded = decodeOutlineReferenceUri(uri);
+          if (!decoded) return false;
+          const group = bridgeState.groups.find((g) => g.turn === decoded.turn);
+          const prompt = group?.prompt ?? '';
+          const step = bridgeState.allSteps.find(
+            (s) => s.turn === decoded.turn && (decoded.step < 0 || s.step === decoded.step),
+          );
+          let body = '';
+          if (step && Array.isArray(step.texts) && step.texts.length > 0) {
+            body =
+              decoded.indexInStep >= 0
+                ? collectSectionBody(step.texts, decoded.heading, decoded.indexInStep)
+                : step.texts.join('\n').trim();
+          }
+          const previewId = `preview:${uri}`;
+          const heading = decoded.heading || fallbackLabel || `第 ${decoded.turn} 轮`;
+          selectionStore.openPreview({
+            id: previewId,
+            turn: decoded.turn,
+            step: decoded.step,
+            prompt,
+            heading,
+            body,
+            uri,
+          });
+          if (body === '' && sessionId) {
+            void fetchRemoteSection(sessionId, { uri }).then((remote) => {
+              if (remote && typeof remote.body === 'string' && remote.body !== '') {
+                selectionStore.updateEntryBody(previewId, remote.body);
+              }
+            });
+          }
+          return true;
+        };
+
+        // Optional integration with uiConversation.userText so sent messages
+        // render @[label](dsh-outline:...) as clickable inline chips.
+        const uiConversation = ctx.get?.('uiConversation');
+        if (uiConversation?.userText && typeof uiConversation.userText.register === 'function') {
+          ctx.effect(() => uiConversation.userText.register(outlineUserTextRule));
+          ctx.slots.inject('conversation.user.text.node', () =>
+            ctx.slots.register(
+              {
+                name: 'conversation.user.text.node',
+                key: 'md-outline',
+                priority: 100,
+              },
+              function OutlineReferenceChipNode(props) {
+                const { node, raw, sessionId } = props;
+                const label = node?.data?.label || raw;
+                const uri = node?.data?.uri || '';
+                return h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-mdo-inline-chip',
+                    title: label,
+                    onClick: (e) => {
+                      e.stopPropagation();
+                      openOutlineReference(sessionId || bridgeState.sessionId, uri, label);
+                    },
+                  },
+                  h(IconQuote),
+                  h('span', { className: 'dsh-mdo-inline-chip-label' }, label),
+                );
+              },
+            ),
+          );
+        }
+
+        // Optional integration with inputTriggers so:
+        // 1. Atomic ReferenceChipNode instances in the composer can serialize
+        //    and open previews when clicked;
+        // 2. Typing `@` in the composer also lists outline headings as candidates!
+        const inputTriggers = ctx.get?.('inputTriggers');
+        if (inputTriggers && typeof inputTriggers.registerSource === 'function') {
+          ctx.effect(() =>
+            inputTriggers.registerSource({
+              trigger: '@',
+              name: 'md-outline',
+              order: 20,
+              showGroupTitle: false,
+              async candidates(_session, { query, quoted }) {
+                if (quoted) return [];
+                const q = (query ?? '').trim().toLowerCase();
+                const out = [];
+                for (const group of bridgeState.groups) {
+                  for (const item of group.items) {
+                    const label = `#${group.turn} · ${item.text}`;
+                    if (q !== '' && !label.toLowerCase().includes(q) && !(group.prompt ?? '').toLowerCase().includes(q)) {
+                      continue;
+                    }
+                    const uri = encodeOutlineReferenceUri({
+                      turn: group.turn,
+                      step: item.step,
+                      indexInStep: item.indexInStep ?? 0,
+                      heading: item.text,
+                    });
+                    const mention = formatOutlineReferenceMention({
+                      turn: group.turn,
+                      heading: item.text,
+                      label,
+                      uri,
+                    });
+                    out.push({
+                      name: label,
+                      description: group.prompt || `第 ${group.turn} 轮回复`,
+                      icon: 'file',
+                      section: '对话目录章节',
+                      value: JSON.stringify({ label, uri, mention }),
+                    });
+                    if (out.length >= 30) break;
+                  }
+                  if (out.length >= 30) break;
+                }
+                return out;
+              },
+              onPick({ candidate }) {
+                try {
+                  const parsed = JSON.parse(candidate.value ?? '{}');
+                  if (!parsed.mention) return undefined;
+                  return {
+                    insert: {
+                      source: 'md-outline',
+                      ref: parsed.uri,
+                      label: parsed.label,
+                      appearance: 'file',
+                      clipboardText: parsed.mention,
+                    },
+                  };
+                } catch (_err) {
+                  return undefined;
+                }
+              },
+              openReference(session, { ref }) {
+                return openOutlineReference(session?.sessionId || bridgeState.sessionId, ref, '');
+              },
+              codec: {
+                clipboardText: (ref) => {
+                  const decoded = decodeOutlineReferenceUri(ref);
+                  const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
+                  return formatOutlineReferenceMention({
+                    turn: decoded?.turn ?? 0,
+                    heading: decoded?.heading ?? '',
+                    label,
+                    uri: ref,
+                  });
+                },
+                serialize: async (ref) => {
+                  const decoded = decodeOutlineReferenceUri(ref);
+                  const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
+                  return formatOutlineReferenceMention({
+                    turn: decoded?.turn ?? 0,
+                    heading: decoded?.heading ?? '',
+                    label,
+                    uri: ref,
+                  });
+                },
+              },
+            }),
+          );
+        }
+
         let transcriptSheet = null;
         ctx.effect(() => {
           const styleEl = document.createElement('style');
@@ -2475,10 +2868,6 @@ window.__ModuleLoader__.load({
           };
         });
 
-        /**
-         * Publish the transcript hiding rule for the current hidden turns.
-         * @param {ReadonlyArray<number>} turns - hidden turn numbers; empty clears the rule.
-         */
         function publishTranscriptRule(turns) {
           if (transcriptSheet === null) return;
           transcriptSheet.textContent = turns.length === 0
@@ -2498,8 +2887,6 @@ window.__ModuleLoader__.load({
           const hasMore = useSession((s) => s.hasMore);
           const projected = useProjection('mdOutline');
           const loaded = useChat(selectLoadedOutline, equalLoadedOutline);
-          // The projection carries both the outline and the hidden-turn ledger;
-          // a client that sees an older array-only value still renders.
           const projectedTurns = Array.isArray(projected) ? projected : (projected?.turns ?? null);
           const hiddenTurns = Array.isArray(projected?.hiddenTurns) ? projected.hiddenTurns : EMPTY_TURNS;
           const groups = useMemo(
@@ -2533,23 +2920,55 @@ window.__ModuleLoader__.load({
         }
 
         /**
+         * Try to insert atomic ReferenceChipNodes into the live Session's
+         * Lexical composer via the scoped `slash/input-insert-reference` event.
+         * Returns true when the live session scope accepted the chips; false
+         * when running in a test stub without InputHub.
+         */
+        function tryInsertAtomicChips(sessionId, entries, inputActions) {
+          const binding = ctx.sessions?.binding?.(sessionId);
+          const actx = binding?.ctx;
+          if (!actx || typeof actx.bail !== 'function' || typeof inputActions?.captureInsertion !== 'function') {
+            return false;
+          }
+          // Replace any previously attached md-outline chips by stripping their
+          // clipboard mentions first if needed, then inserting each chip at the caret.
+          let anyInserted = false;
+          for (const entry of entries) {
+            const span = inputActions.captureInsertion();
+            const label = entry.label || (entry.heading ? `#${entry.turn} · ${entry.heading}` : `#${entry.turn}`);
+            const uri = entry.uri || encodeOutlineReferenceUri(entry);
+            const mention = formatOutlineReferenceMention({ ...entry, label, uri });
+            const applied = actx.bail(actx, 'slash/input-insert-reference', {
+              reference: {
+                source: 'md-outline',
+                ref: uri,
+                label,
+                appearance: 'file',
+                clipboardText: mention,
+              },
+              span,
+            });
+            if (applied === true) anyInserted = true;
+          }
+          return anyInserted;
+        }
+
+        /**
          * Reference card above the composer, its detail sidebar, and the
          * hide/restore actions.
-         *
-         * This slot owns `sessionId`, so the outline's selections become Host
-         * calls from here: a reference attachment, or a hide/restore.
          */
         function ReferenceDock(props) {
-          const { useSelection, useHiddenTurns, sessionId, inputActions, useInput, t } = props;
+          const { useSelection, useHiddenTurns: _useHiddenTurns, sessionId, inputActions, useInput, t } = props;
           const selection = useSelection((s) => s);
           const liveDraft = useInput((s) => s.draft);
+          const inputPhase = useInput((s) => s.phase);
           const [busy, setBusy] = useState(false);
           const [notice, setNotice] = useState(null);
-          /** The reference block currently written into the draft. */
           const lastAttachedRef = useRef(null);
-          /** The composer text, kept current so the effect never writes stale content. */
           const draftRef = useRef(liveDraft);
           draftRef.current = liveDraft;
+          const prevPhaseRef = useRef(inputPhase);
 
           useEffect(() => {
             if (notice === null) return undefined;
@@ -2565,25 +2984,56 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId]);
 
-          // The confirmed reference lives in the draft, because that is the only
-          // place a message picks up content from: a record on the Host is read
-          // after the turn has already claimed its messages. Confirming writes
-          // the block, detaching removes it, and whatever the reader typed
-          // around it stays untouched.
+          // Automatically clear the attached reference card once the user submits
+          // the message (either via phase transition or draft clearing after send).
+          useEffect(() => {
+            const wasSubmitting = prevPhaseRef.current === 'submitting' || prevPhaseRef.current === 'adjudicating';
+            prevPhaseRef.current = inputPhase;
+            if (selection.attached.length > 0 && (inputPhase === 'submitting' || (wasSubmitting && inputPhase === 'plain'))) {
+              lastAttachedRef.current = '';
+              selectionStore.detach();
+            }
+          }, [inputPhase, selection.attached.length]);
+
+          // Also fetch missing section bodies from Host when an unloaded turn's
+          // section is attached or previewed.
+          useEffect(() => {
+            for (const entry of selection.attached) {
+              if (!entry.body && sessionId) {
+                void fetchRemoteSection(sessionId, entry).then((remote) => {
+                  if (remote && typeof remote.body === 'string' && remote.body !== '') {
+                    selectionStore.updateEntryBody(entry.id, remote.body);
+                  }
+                });
+              }
+            }
+          }, [selection.attached, sessionId]);
+
+          // Synchronize confirmed attachments into the composer:
+          // - In the live DSH Web app (where InputHub & inputTriggers are active),
+          //   insert native atomic ReferenceChipNodes via `slash/input-insert-reference`
+          //   so the composer displays compact `@` pills instead of raw Markdown!
+          // - In unit-test stubs (where `ctx.sessions.binding` is absent), fall back
+          //   to `buildReferenceText` via `setDraft`.
           useEffect(() => {
             const entries = selection.attached;
-            const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
-            if (next === lastAttachedRef.current) return;
-            lastAttachedRef.current = next;
+            const signature = entries.map((e) => e.id).join(',');
+            if (signature === lastAttachedRef.current) return;
+            lastAttachedRef.current = signature;
 
+            if (entries.length > 0 && tryInsertAtomicChips(sessionId, entries, inputActions)) {
+              return;
+            }
+
+            const next = entries.length === 0 ? '' : buildReferenceText(entries).text;
             const current = draftRef.current;
             const withoutBlock = stripReferenceBlocks(current);
             const merged = next === '' ? withoutBlock : (withoutBlock === '' ? next : `${next}\n\n${withoutBlock}`);
-            // Mount with nothing attached must not touch the composer.
+            // Mount with nothing attached must not touch a composer that carries no reference block.
             if (merged === current) return;
             draftRef.current = merged;
             inputActions.setDraft(merged);
-          }, [selection.attached, inputActions]);
+          }, [selection.attached, sessionId, inputActions]);
 
           const applyHidden = useCallback(async (rawTurns, route) => {
             if (busy) return;
@@ -2610,8 +3060,6 @@ window.__ModuleLoader__.load({
             }
           }, [busy, sessionId, t]);
 
-          // The outline asks for a confirmation through the store; this slot
-          // owns the dialog because only it can reach the composer and routes.
           useEffect(() => {
             restoreActionRef.current = async (turns) => {
               await applyHidden(turns, RESTORE_ROUTE);
@@ -2619,7 +3067,9 @@ window.__ModuleLoader__.load({
             return () => {
               restoreActionRef.current = null;
             };
-          }, [applyHidden]);          const confirmIds = selection.confirmIds;
+          }, [applyHidden]);
+
+          const confirmIds = selection.confirmIds;
           const selectedTurns = useMemo(() => {
             if (confirmIds === null) return [];
             const all = new Set();
@@ -2629,9 +3079,10 @@ window.__ModuleLoader__.load({
             return [...all].sort((a, b) => a - b);
           }, [confirmIds, selection.entries]);
 
-          // The card is the confirmed attachment: it appears only after the
-          // reader confirms, and it is what the next message carries.
           const attached = selection.attached;
+          const previewItem = selection.preview;
+          const sidebarItems = previewItem ? [previewItem] : attached;
+
           const card =
             attached.length === 0
               ? null
@@ -2688,9 +3139,9 @@ window.__ModuleLoader__.load({
                 h(
                   'div',
                   { className: 'dsh-mdo-side-body' },
-                  attached.length === 0
+                  sidebarItems.length === 0
                     ? h('div', { className: 'dsh-mdo-empty' }, t('selectionEmpty'))
-                    : attached.map((entry) =>
+                    : sidebarItems.map((entry) =>
                         h(
                           'div',
                           { key: entry.id, className: 'dsh-mdo-sel-item' },
@@ -2704,17 +3155,19 @@ window.__ModuleLoader__.load({
                                 ? `#${entry.turn} · ${entry.prompt}`
                                 : t('turnLabel', { turn: entry.turn }),
                             ),
-                            h(
-                              'button',
-                              {
-                                type: 'button',
-                                className: 'dsh-mdo-sel-item-remove',
-                                title: t('clearSelection'),
-                                'aria-label': t('clearSelection'),
-                                onClick: () => selectionStore.removeAttached(entry.id),
-                              },
-                              h(IconClear),
-                            ),
+                            !previewItem
+                              ? h(
+                                  'button',
+                                  {
+                                    type: 'button',
+                                    className: 'dsh-mdo-sel-item-remove',
+                                    title: t('clearSelection'),
+                                    'aria-label': t('clearSelection'),
+                                    onClick: () => selectionStore.removeAttached(entry.id),
+                                  },
+                                  h(IconClear),
+                                )
+                              : null,
                           ),
                           h('div', { className: 'dsh-mdo-sel-item-title' }, entry.heading),
                           entry.body
@@ -2723,20 +3176,22 @@ window.__ModuleLoader__.load({
                         ),
                       ),
                 ),
-                h(
-                  'div',
-                  { className: 'dsh-mdo-side-foot' },
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'dsh-mdo-btn',
-                      disabled: attached.length === 0,
-                      onClick: () => selectionStore.detach(),
-                    },
-                    t('detachReference'),
-                  ),
-                ),
+                !previewItem
+                  ? h(
+                      'div',
+                      { className: 'dsh-mdo-side-foot' },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-mdo-btn',
+                          disabled: attached.length === 0,
+                          onClick: () => selectionStore.detach(),
+                        },
+                        t('detachReference'),
+                      ),
+                    )
+                  : null,
               )
             : null;
 
@@ -2816,11 +3271,6 @@ window.__ModuleLoader__.load({
           );
         }
 
-        /**
-         * Collapsible list of the turns hidden from the model, with a restore
-         * action per turn. It sits under the outline so a hidden turn keeps a
-         * visible address instead of vanishing without trace.
-         */
         function HiddenTurnsSection(props) {
           const { t, hiddenTurnNums, hiddenOpen, setHiddenOpen, groups, restoringTurns, onRestore } = props;
           if (hiddenTurnNums === undefined || hiddenTurnNums.length === 0) return null;
@@ -2991,7 +3441,8 @@ window.__ModuleLoader__.load({
 
           const trimmedQuery = searchQuery.trim();
           const hasAnySearchableContent = totalHeadings > 0 || bridge.allSteps.length > 0 || bridge.hasMore;
-          const panelOpen = totalHeadings > 0 ? userOpen : manualEmptyOpen;
+          const hasOutlineTurns = totalHeadings > 0 || bridge.groups.length > 0 || hiddenTurnNums.length > 0;
+          const panelOpen = hasOutlineTurns ? userOpen : manualEmptyOpen;
 
           // Debounced Host full-log body search when session has unloaded history or extra turns
           useEffect(() => {
@@ -3112,7 +3563,7 @@ window.__ModuleLoader__.load({
           }, [trimmedQuery, bridge.allSteps, bridge.loadedTurnNums, bridge.groups, remoteBodyHits]);
 
           const toggleOpen = useCallback(() => {
-            if (totalHeadings > 0) {
+            if (hasOutlineTurns) {
               setUserOpen((prev) => {
                 const next = !prev;
                 writeStoredOpen(next);
@@ -3121,7 +3572,7 @@ window.__ModuleLoader__.load({
             } else {
               setManualEmptyOpen((prev) => !prev);
             }
-          }, [totalHeadings]);
+          }, [hasOutlineTurns]);
 
           // Sync header height and column width CSS custom properties onto Conversation .root
           useEffect(() => {
@@ -3601,7 +4052,7 @@ window.__ModuleLoader__.load({
 
           if (!bridge.active) return null;
 
-          const showTurnHeaders = bridge.groups.length > 1;
+          const showTurnHeaders = bridge.groups.length > 1 || selecting || bridge.groups.some((g) => g.items.length === 0);
 
           return h(
             'div',
@@ -3639,7 +4090,7 @@ window.__ModuleLoader__.load({
                       h(IconDoubleChevronLeft),
                     ),
                     h('span', { className: 'dsh-mdo-header-title' }, t('title')),
-                    totalHeadings > 0
+                    (totalHeadings > 0 || bridge.groups.length > 0)
                       ? h(
                           'button',
                           {
@@ -3722,7 +4173,7 @@ window.__ModuleLoader__.load({
                     'div',
                     { ref: listScrollRef, className: 'dsh-mdo-scroll' },
                     trimmedQuery === ''
-                      ? totalHeadings === 0
+                      ? totalHeadings === 0 && bridge.groups.length === 0
                         ? h('div', { className: 'dsh-mdo-empty' }, t('empty'))
                         : bridge.groups.map((group) => {
                             const turnCollapsed = collapsedTurns.has(group.turn);
@@ -3770,7 +4221,7 @@ window.__ModuleLoader__.load({
                                               // A turn with no headings has no rows to
                                               // tick, so its whole reply is the entry.
                                               if (rows.length === 0) {
-                                                const entry = buildHeadlessSelection(group, bridge.allSteps);
+                                                const entry = buildHeadlessSelection(group, bridge.allSteps, { allowEmpty: true });
                                                 if (entry === null) return;
                                                 if (selectedIds.has(entry.id) !== next) {
                                                   selectionStore.toggleEntry(entry);

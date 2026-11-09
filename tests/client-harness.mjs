@@ -144,6 +144,9 @@ export function loadClient() {
 
   if (loadedPlugin === null) throw new Error('client factory did not produce a plugin')
 
+  const bailed = []
+  let bindingImpl = () => undefined
+
   const ctx = {
     effect: (fn) => {
       try {
@@ -154,7 +157,9 @@ export function loadClient() {
       return () => {}
     },
     locale: { register: () => () => {} },
-    sessions: { binding: () => undefined },
+    sessions: {
+      binding: (id) => bindingImpl(id),
+    },
     slots: {
       inject: (_key, callback) => {
         callback()
@@ -190,6 +195,10 @@ export function loadClient() {
     setFetch: (impl) => {
       fetchImpl = impl
     },
+    setBinding: (impl) => {
+      bindingImpl = impl
+    },
+    bailed,
     /** Begin another render of the same mounted tree, reusing its refs. */
     __render: () => React.__render(),
   }

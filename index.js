@@ -1,17 +1,20 @@
 /**
  * Host half of dsh-markdown-outline.
  *
- * Registers the optional `mdOutline` session-projection unit so the Client
- * receives Markdown headings across the entire Session log, including turns
- * outside the currently paged browser event window. It also owns the routes
- * that change what the model sees: hiding whole turns from the model-visible
- * surface, and restoring them.
- *
- * A hide is an append-only surface replacement, never a log edit: the selected
- * turns are shadowed by one user message recording what was removed, so the
- * transcript stays replayable and the same range can be unhidden later. The
- * durable ledger of hides is this plugin's own ignorable records, read back on
- * every observation and carried into each request as one prompt context.
+ * Registers:
+ * 1. `mdOutline` session-projection unit so the Client receives Markdown
+ *    headings across the entire Session log (including unloaded history) and
+ *    the current hidden-turn ledger.
+ * 2. `agent/pre-step` waterfall interceptor that expands structured
+ *    `@[label](dsh-outline:<payload>)` chip mentions into a dedicated recall
+ *    context message right after the citing user message, keeping the user
+ *    bubble clean while delivering full section Markdown to the model.
+ * 3. `systemPrompt` context provider informing the model about hidden turns.
+ * 4. Authenticated HTTP routes:
+ *    - `GET  /md-outline/search`   full-log body keyword search
+ *    - `GET  /md-outline/section`  full-log section or turn Markdown lookup
+ *    - `POST /md-outline/hide`     hide selected turns from UI & model context
+ *    - `POST /md-outline/restore`  restore hidden turns back to UI & context
  */
 
 import { appendPluginRecord } from '@deepseek-ai/dsh-session';
@@ -19,6 +22,9 @@ import { appendPluginRecord } from '@deepseek-ai/dsh-session';
 const PROMPT_PREVIEW_LIMIT = 60;
 const HEADING_TEXT_LIMIT = 140;
 const MAX_HEADINGS_PER_SESSION = 600;
+
+/** URI scheme used inside `@[label](dsh-outline:<base64url>)` mentions. */
+export const OUTLINE_REFERENCE_SCHEME = 'dsh-outline:';
 
 /**
  * Strip inline Markdown formatting to produce plain outline label text.
@@ -68,10 +74,10 @@ function isNonParagraphLine(line) {
 /**
  * Extract ordered CommonMark/GFM headings from one Markdown text block.
  * @param {string} markdown
- * @param {number} maxRemaining
+ * @param {number} [maxRemaining]
  * @returns {Array<{ depth: number, text: string }>}
  */
-function extractBlockHeadings(markdown, maxRemaining) {
+function extractBlockHeadings(markdown, maxRemaining = MAX_HEADINGS_PER_SESSION) {
   if (!markdown || maxRemaining <= 0) return [];
   const lines = markdown.split(/\r?\n/);
   const result = [];
@@ -110,7 +116,6 @@ function extractBlockHeadings(markdown, maxRemaining) {
     const atx = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/.exec(line);
     if (atx !== null) {
       const body = atx[2] ?? '';
-      // Bare `#hashtag` without space after `#` is not an ATX heading
       const afterHashes = line.replace(/^ {0,3}#{1,6}/, '');
       if (afterHashes === '' || /^[ \t]/.test(afterHashes)) {
         paragraphLines = [];
@@ -147,22 +152,182 @@ function extractBlockHeadings(markdown, maxRemaining) {
 }
 
 /**
+ * Collect the reply Markdown body under the heading at `targetIndexInStep`
+ * across all text blocks of one assistant step, stopping before the next
+ * heading at the same or shallower depth. Respects fenced code blocks and both
+ * ATX and Setext headings.
+ *
+ * @param {ReadonlyArray<string>} textBlocks
+ * @param {number} targetIndexInStep
+ * @returns {{ heading: string, depth: number, body: string } | null}
+ */
+function extractStepSectionByIndex(textBlocks, targetIndexInStep) {
+  if (!Array.isArray(textBlocks) || textBlocks.length === 0) return null;
+  if (typeof targetIndexInStep !== 'number' || targetIndexInStep < 0) {
+    const body = textBlocks.join('\n\n').trim();
+    return { heading: '', depth: 1, body };
+  }
+
+  let headingOrdinal = -1;
+  let capturing = false;
+  let targetHeading = '';
+  let targetDepth = 1;
+  const capturedLines = [];
+
+  for (const markdown of textBlocks) {
+    if (typeof markdown !== 'string' || markdown === '') continue;
+    const lines = markdown.split(/\r?\n/);
+    let fenceChar = '';
+    let fenceLen = 0;
+    let paragraphLines = [];
+    let paragraphRawLines = [];
+
+    const flushPendingParagraph = () => {
+      if (capturing && paragraphRawLines.length > 0) {
+        for (const rawLine of paragraphRawLines) capturedLines.push(rawLine);
+      }
+      paragraphLines = [];
+      paragraphRawLines = [];
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? '';
+
+      if (fenceChar !== '') {
+        const closeMatch = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+        if (
+          closeMatch !== null &&
+          closeMatch[1][0] === fenceChar &&
+          closeMatch[1].length >= fenceLen
+        ) {
+          fenceChar = '';
+          fenceLen = 0;
+        }
+        if (capturing) capturedLines.push(line);
+        continue;
+      }
+
+      const openFence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (
+        openFence !== null &&
+        !(openFence[1][0] === '`' && openFence[2].includes('`'))
+      ) {
+        flushPendingParagraph();
+        fenceChar = openFence[1][0];
+        fenceLen = openFence[1].length;
+        if (capturing) capturedLines.push(line);
+        continue;
+      }
+
+      const atx = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/.exec(line);
+      if (atx !== null) {
+        const afterHashes = line.replace(/^ {0,3}#{1,6}/, '');
+        if (afterHashes === '' || /^[ \t]/.test(afterHashes)) {
+          flushPendingParagraph();
+          const rawBody = (atx[2] ?? '').replace(/^#+[ \t]*$/, '');
+          const text = cleanHeadingText(rawBody);
+          if (text !== '') {
+            const depth = atx[1].length;
+            headingOrdinal += 1;
+            if (!capturing) {
+              if (headingOrdinal === targetIndexInStep) {
+                capturing = true;
+                targetHeading = text;
+                targetDepth = depth;
+              }
+            } else if (depth <= targetDepth) {
+              return {
+                heading: targetHeading,
+                depth: targetDepth,
+                body: capturedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+              };
+            } else {
+              capturedLines.push(line);
+            }
+            continue;
+          }
+        }
+      }
+
+      if (paragraphLines.length > 0) {
+        const setext = /^ {0,3}(=+|-+)[ \t]*$/.exec(line);
+        if (setext !== null) {
+          const depth = setext[1][0] === '=' ? 1 : 2;
+          const text = cleanHeadingText(paragraphLines.join(' '));
+          if (text !== '') {
+            paragraphLines = [];
+            paragraphRawLines = [];
+            headingOrdinal += 1;
+            if (!capturing) {
+              if (headingOrdinal === targetIndexInStep) {
+                capturing = true;
+                targetHeading = text;
+                targetDepth = depth;
+              }
+            } else if (depth <= targetDepth) {
+              return {
+                heading: targetHeading,
+                depth: targetDepth,
+                body: capturedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+              };
+            } else {
+              capturedLines.push(line);
+            }
+            continue;
+          }
+        }
+      }
+
+      if (isNonParagraphLine(line)) {
+        flushPendingParagraph();
+        if (capturing) capturedLines.push(line);
+      } else {
+        paragraphLines.push(line.trim());
+        paragraphRawLines.push(line);
+      }
+    }
+    flushPendingParagraph();
+  }
+
+  if (!capturing) return null;
+  return {
+    heading: targetHeading,
+    depth: targetDepth,
+    body: capturedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+  };
+}
+
+/**
  * Extract bounded prompt preview from user message content blocks.
- * @param {ReadonlyArray<{ type: string, text?: string }>} content
+ * Falls back to image/file indicators when a user prompt has no text blocks.
+ * @param {ReadonlyArray<{ type: string, text?: string, attachment?: { name?: string } }>} content
  * @returns {string}
  */
 function previewPrompt(content) {
   if (!Array.isArray(content)) return '';
   let text = '';
   let unread = false;
+  let hasImage = false;
+  let fileName = '';
   for (const block of content) {
-    if (!block || block.type !== 'text' || typeof block.text !== 'string') continue;
+    if (!block) continue;
+    if (block.type === 'image') {
+      hasImage = true;
+      continue;
+    }
+    if (block.type === 'file') {
+      fileName = block.attachment?.name || 'file';
+      continue;
+    }
+    if (block.type !== 'text' || typeof block.text !== 'string') continue;
+    // Strip our own inline outline reference mentions from the prompt preview
+    const cleanedBlock = parseOutlineReferenceText(block.text).text;
     if (text.length >= PROMPT_PREVIEW_LIMIT * 2) {
       unread = true;
       break;
     }
-    const clipped = block.text.length > PROMPT_PREVIEW_LIMIT * 2;
-    const chunk = clipped ? block.text.slice(0, PROMPT_PREVIEW_LIMIT * 2) : block.text;
+    const clipped = cleanedBlock.length > PROMPT_PREVIEW_LIMIT * 2;
+    const chunk = clipped ? cleanedBlock.slice(0, PROMPT_PREVIEW_LIMIT * 2) : cleanedBlock;
     text += text === '' ? chunk : ` ${chunk}`;
     if (clipped) {
       unread = true;
@@ -170,10 +335,205 @@ function previewPrompt(content) {
     }
   }
   const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized === '') {
+    if (hasImage) return '[图片]';
+    if (fileName !== '') return `[${fileName}]`;
+    return '';
+  }
   if (normalized.length > PROMPT_PREVIEW_LIMIT - 1) {
     return `${normalized.slice(0, PROMPT_PREVIEW_LIMIT - 1).trimEnd()}…`;
   }
   return unread && normalized !== '' ? `${normalized}…` : normalized;
+}
+
+/**
+ * Encode one outline reference descriptor into a canonical `dsh-outline:` URI.
+ * @param {{ turn: number, step?: number, indexInStep?: number, heading?: string }} ref
+ * @returns {string}
+ */
+function encodeOutlineReferenceUri(ref) {
+  const payload = {
+    t: Number(ref.turn) || 0,
+    s: typeof ref.step === 'number' ? ref.step : -1,
+    i: typeof ref.indexInStep === 'number' ? ref.indexInStep : -1,
+    ...(typeof ref.heading === 'string' && ref.heading !== '' ? { h: ref.heading.slice(0, 80) } : {}),
+  };
+  return `${OUTLINE_REFERENCE_SCHEME}${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+}
+
+/**
+ * Decode a `dsh-outline:` URI back into its structured coordinates.
+ * @param {string} uri
+ * @returns {{ turn: number, step: number, indexInStep: number, heading: string } | null}
+ */
+function decodeOutlineReferenceUri(uri) {
+  if (typeof uri !== 'string' || !uri.startsWith(OUTLINE_REFERENCE_SCHEME)) return null;
+  const raw = uri.slice(OUTLINE_REFERENCE_SCHEME.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || typeof parsed.t !== 'number') return null;
+    return {
+      turn: parsed.t,
+      step: typeof parsed.s === 'number' ? parsed.s : -1,
+      indexInStep: typeof parsed.i === 'number' ? parsed.i : -1,
+      heading: typeof parsed.h === 'string' ? parsed.h : '',
+    };
+  } catch (error) {
+    void error;
+    return null;
+  }
+}
+
+/**
+ * Format a canonical `@[label](dsh-outline:...)` mention.
+ * @param {{ turn: number, step?: number, indexInStep?: number, heading?: string, label?: string }} ref
+ * @returns {string}
+ */
+function formatOutlineReferenceMention(ref) {
+  const rawLabel = ref.label || ref.heading || `#${ref.turn}`;
+  const escaped = String(rawLabel).replace(/[\\\]]/g, (m) => `\\${m}`);
+  return `@[${escaped}](${encodeOutlineReferenceUri(ref)})`;
+}
+
+/**
+ * Parse all `@[label](dsh-outline:...)` mentions from a user message text block.
+ * @param {string} text
+ * @returns {{ text: string, references: Array<{ label: string, uri: string, turn: number, step: number, indexInStep: number, heading: string }> }}
+ */
+function parseOutlineReferenceText(text) {
+  if (typeof text !== 'string' || !text.includes(OUTLINE_REFERENCE_SCHEME)) {
+    return { text: text ?? '', references: [] };
+  }
+  const references = [];
+  const pattern = /@\[((?:\\.|[^\\\]])*)\]\((dsh-outline:[A-Za-z0-9_-]+)\)/gu;
+  const rendered = text.replace(pattern, (_match, rawLabel, uri) => {
+    const decoded = decodeOutlineReferenceUri(uri);
+    const label = String(rawLabel ?? '').replace(/\\(.)/gu, '$1');
+    if (decoded !== null) {
+      references.push({
+        label,
+        uri,
+        turn: decoded.turn,
+        step: decoded.step,
+        indexInStep: decoded.indexInStep,
+        heading: decoded.heading || label,
+      });
+    }
+    return `@${label}`;
+  });
+  return { text: rendered, references };
+}
+
+/**
+ * Resolve one section or whole-turn reference against a Session event log.
+ * Works for both loaded and unloaded historical turns.
+ * @param {ReadonlyArray<any>} events
+ * @param {{ turn: number, step?: number, indexInStep?: number, heading?: string }} target
+ * @returns {{ turn: number, step: number, indexInStep: number, prompt: string, heading: string, body: string } | null}
+ */
+function resolveSectionFromEvents(events, target) {
+  if (!Array.isArray(events) || typeof target?.turn !== 'number') return null;
+  const targetTurn = target.turn;
+  const targetStep = typeof target.step === 'number' ? target.step : -1;
+  const targetIndex = typeof target.indexInStep === 'number' ? target.indexInStep : -1;
+
+  let curTurn = null;
+  let prompt = '';
+  const stepMap = new Map();
+
+  for (const event of events) {
+    if (!event || typeof event.type !== 'string') continue;
+    if (event.type === 'turn/start') {
+      curTurn = event.data?.turn ?? null;
+      continue;
+    }
+    if (event.type === 'user/message' && curTurn === targetTurn && event.data?.source?.kind === 'user') {
+      if (prompt === '') prompt = previewPrompt(event.data.content);
+      continue;
+    }
+    if (event.type === 'assistant/message' && event.data?.turn === targetTurn) {
+      const stepNum = typeof event.data?.step === 'number' ? event.data.step : 0;
+      const content = event.data?.message?.content;
+      if (!Array.isArray(content)) continue;
+      const textBlocks = content
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text);
+      if (textBlocks.length > 0) {
+        stepMap.set(stepNum, textBlocks);
+      }
+    }
+  }
+
+  const orderedSteps = [...stepMap.entries()].sort((a, b) => a[0] - b[0]);
+  if (orderedSteps.length === 0) {
+    if (prompt === '') return null;
+    return {
+      turn: targetTurn,
+      step: 0,
+      indexInStep: -1,
+      prompt,
+      heading: target.heading || prompt || `第 ${targetTurn} 轮`,
+      body: prompt,
+    };
+  }
+
+  // Headless / whole-turn reference
+  if (targetStep < 0 || targetIndex < 0) {
+    const allTexts = orderedSteps.flatMap(([, texts]) => texts);
+    return {
+      turn: targetTurn,
+      step: orderedSteps[0][0],
+      indexInStep: -1,
+      prompt,
+      heading: target.heading || prompt || `第 ${targetTurn} 轮`,
+      body: allTexts.join('\n\n').trim(),
+    };
+  }
+
+  const stepTexts = stepMap.get(targetStep) ?? orderedSteps[0][1];
+  const extracted = extractStepSectionByIndex(stepTexts, targetIndex);
+  if (extracted !== null) {
+    return {
+      turn: targetTurn,
+      step: targetStep,
+      indexInStep: targetIndex,
+      prompt,
+      heading: extracted.heading || target.heading || prompt || `第 ${targetTurn} 轮`,
+      body: extracted.body,
+    };
+  }
+
+  // Fallback by matching heading text if step/index shifted
+  if (target.heading) {
+    for (const [sNum, texts] of orderedSteps) {
+      const headings = texts.flatMap((t) => extractBlockHeadings(t));
+      const idx = headings.findIndex((h) => h.text === target.heading);
+      if (idx >= 0) {
+        const sec = extractStepSectionByIndex(texts, idx);
+        if (sec !== null) {
+          return {
+            turn: targetTurn,
+            step: sNum,
+            indexInStep: idx,
+            prompt,
+            heading: sec.heading,
+            body: sec.body,
+          };
+        }
+      }
+    }
+  }
+
+  const fallbackBody = stepTexts.join('\n\n').trim();
+  return {
+    turn: targetTurn,
+    step: targetStep,
+    indexInStep: targetIndex,
+    prompt,
+    heading: target.heading || prompt || `第 ${targetTurn} 轮`,
+    body: fallbackBody,
+  };
 }
 
 /**
@@ -261,11 +621,6 @@ const stateSchema = {
 const HIDE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn';
 const RESTORE_RECORD = 'plugin:dsh-markdown-outline/hidden-turn-restored';
 
-/**
- * The record names the projection folds, so hiding takes effect in the UI the
- * same way it takes effect for the model.
- */
-
 const EMPTY_TURNS = Object.freeze([]);
 const EMPTY_STATE = Object.freeze({
   allTurns: EMPTY_TURNS,
@@ -345,16 +700,13 @@ const mdOutlineProjectionDefinition = {
           for (const h of parsed) headings.push(h);
         }
 
-        // A reply with no headings still belongs in the outline: it is a turn the
-        // reader can see and may want to hide, so the turn is kept with an empty
-        // step list rather than dropped for having nothing to list.
         let nextAll;
         if (existingTurn === undefined) {
           const newTurn = {
             turn: turnNum,
             seq: event.seq,
             prompt: '',
-            steps: [{ step: stepNum, seq: event.seq, headings }],
+            steps: headings.length === 0 ? [] : [{ step: stepNum, seq: event.seq, headings }],
           };
           nextAll = [...state.allTurns, newTurn].sort((a, b) => a.turn - b.turn);
         } else {
@@ -371,13 +723,12 @@ const mdOutlineProjectionDefinition = {
           );
         }
 
-        // Every turn the log carries is listed, headings or not.
         return { ...state, allTurns: nextAll, visibleTurns: nextAll };
       }
       case HIDE_RECORD: {
         const items = Array.isArray(event.data?.turns) ? event.data.turns : [];
         const added = items
-          .map((item) => item?.turn)
+          .map((item) => (typeof item === 'number' ? item : item?.turn))
           .filter((turn) => typeof turn === 'number' && Number.isInteger(turn));
         if (added.length === 0) return state;
         const next = new Set(state.hiddenTurns);
@@ -402,6 +753,7 @@ const mdOutlineProjectionDefinition = {
 };
 
 const SEARCH_ROUTE_PATH = '/md-outline/search';
+const SECTION_ROUTE_PATH = '/md-outline/section';
 const HIDE_ROUTE_PATH = '/md-outline/hide';
 const RESTORE_ROUTE_PATH = '/md-outline/restore';
 
@@ -550,7 +902,6 @@ function searchBlockBody(markdown, needleLower, initialHeadingCount, maxHits) {
       }
     }
 
-    // List items, blockquotes, and table rows flush per line so snippets stay localized
     if (/^\s*$/.test(line) || /^ {0,3}(?:[-*_][ \t]*){3,}$/.test(line)) {
       flushParagraph();
     } else if (
@@ -622,7 +973,6 @@ function searchSessionAssistantEvents(events, rawQuery) {
       if (!turnMeta.has(turnNum)) {
         turnMeta.set(turnNum, { turn: turnNum, seq: event.seq, prompt: '' });
       }
-      // Latest settled assistant message for (turn, step) wins over earlier retries
       stepMap.set(`${turnNum}:${stepNum}`, {
         turn: turnNum,
         step: stepNum,
@@ -677,20 +1027,14 @@ function searchSessionAssistantEvents(events, rawQuery) {
 }
 
 // ---------------------------------------------------------------------------
-// Turn hiding.
-//
-// A hide replaces the surface range covering selected turns with one user
-// message that records what went out, so the request stops carrying them. The
-// log itself is untouched, which is what lets the same range be restored.
+// Turn hiding & Reference injection.
 // ---------------------------------------------------------------------------
-
-/** This plugin's own durable record types, under its package name. */
 
 /** Prompt-context name and placement for the running hidden-turn ledger. */
 const HIDDEN_CONTEXT_NAME = 'md-outline:hidden-turns';
 const HIDDEN_CONTEXT_ORDER = 115.5;
 
-/** Body ceiling for the two mutating routes; both take small JSON objects. */
+/** Body ceiling for the mutating routes. */
 const MAX_BODY_BYTES = 64 * 1024;
 
 /** Longest reference body accepted in one request, in characters. */
@@ -699,7 +1043,7 @@ const MAX_REFERENCE_CHARS = 120_000;
 /**
  * Read a bounded request body as UTF-8 text.
  * @param {import('node:http').IncomingMessage} req
- * @returns {Promise<string | null>} the body, or null past {@link MAX_BODY_BYTES}.
+ * @returns {Promise<string | null>}
  */
 async function readBoundedBody(req) {
   const chunks = [];
@@ -725,7 +1069,6 @@ function parseJsonObject(text) {
   try {
     body = JSON.parse(text);
   } catch (error) {
-    // A non-JSON body is exactly the null case; nothing else can be reported.
     void error;
     return null;
   }
@@ -734,13 +1077,8 @@ function parseJsonObject(text) {
 
 /**
  * Read this plugin's hide ledger from one event log.
- *
- * Each hide adds its turn numbers and the surface seqs it shadowed; a restore
- * removes them again. The result therefore describes the current model-visible
- * hiding exactly, including after a reload.
  * @param {ReadonlyArray<any>} events
- * @returns {{ turns: Map<number, { turn: number, hideSeq: number, seqs: number[] }>, bySeq: Map<number, number>, seq: number }}
- *   hidden turns by number, the turn that owns each shadowed seq, and the last ledger seq.
+ * @returns {{ turns: Map<number, { turn: number, hideSeq: number, seqs: number[], visible: boolean }>, bySeq: Map<number, number>, seq: number }}
  */
 function foldHiddenTurns(events) {
   const turns = new Map();
@@ -763,18 +1101,16 @@ function foldHiddenTurns(events) {
     lastSeq = Math.max(lastSeq, event.seq);
     if (event.type === HIDE_RECORD) {
       for (const item of data.turns) {
-        if (typeof item?.turn !== 'number' || !Array.isArray(item.seqs)) continue;
-        unlink(item.turn);
-        const seqs = item.seqs.filter((seq) => typeof seq === 'number');
-        for (const seq of seqs) bySeq.set(seq, item.turn);
-        turns.set(item.turn, { turn: item.turn, hideSeq: event.seq, seqs, visible: false });
+        const turnNum = typeof item === 'number' ? item : item?.turn;
+        if (typeof turnNum !== 'number') continue;
+        const prevSeqs = turns.get(turnNum)?.seqs ?? [];
+        const rawSeqs = Array.isArray(item?.seqs) ? item.seqs : prevSeqs;
+        unlink(turnNum);
+        const seqs = rawSeqs.filter((seq) => typeof seq === 'number');
+        for (const seq of seqs) bySeq.set(seq, turnNum);
+        turns.set(turnNum, { turn: turnNum, hideSeq: event.seq, seqs, visible: false });
       }
     } else {
-      // Restoring shows the turn again but cannot put its content back into
-      // the model context: a replacement that shadowed those nodes is not
-      // reversible. Keep the turn in the ledger with its shadowed seqs so a
-      // later hide knows the context work is already done, and mark it
-      // visible so the transcript and outline show it.
       for (const turn of data.turns) {
         if (typeof turn !== 'number') continue;
         const entry = turns.get(turn);
@@ -789,10 +1125,6 @@ function foldHiddenTurns(events) {
 
 /**
  * Turns the outline and transcript should currently show as hidden.
- *
- * A restored turn stays in {@link foldHiddenTurns}'s ledger — its context was
- * already shadowed — but it is visible again, so it belongs in neither the
- * hidden list nor the transcript filter.
  * @param {ReadonlyArray<any>} events
  * @returns {number[]} hidden turn numbers, ascending.
  */
@@ -806,13 +1138,8 @@ function hiddenTurnNumbers(events) {
 
 /**
  * Replay a session log into its current model-visible surface.
- *
- * This mirrors the Host's fold for the two operations a log can carry: append,
- * and a positional replacement that shadows an inclusive range. It is local so
- * the hide route can decide what is still addressable without importing the
- * Host's surface module, which is not resolvable outside a running Host.
  * @param {ReadonlyArray<any>} events
- * @returns {Set<number>} seqs currently on the surface.
+ * @returns {Set<number>}
  */
 function foldLiveSurface(events) {
   return new Set(foldLiveSurfaceOrder(events));
@@ -820,12 +1147,8 @@ function foldLiveSurface(events) {
 
 /**
  * Replay a session log into its surface node order.
- *
- * The order matters: `replace` addresses nodes by position, and the surface is
- * not sorted by seq. A replacement carries a history instead of staying in log
- * order, so a range built from the smallest and largest seq can point backwards.
  * @param {ReadonlyArray<any>} events
- * @returns {number[]} surface seqs in surface order.
+ * @returns {number[]}
  */
 function foldLiveSurfaceOrder(events) {
   const nodes = [];
@@ -847,15 +1170,10 @@ function foldLiveSurfaceOrder(events) {
 
 /**
  * Collect the surface seqs belonging to selected turns.
- *
- * A turn owns every surface node at or after its `turn/start` and before the
- * next turn boundary, so the caller can shadow a contiguous range without
- * slicing a turn in half.
  * @param {ReadonlyArray<any>} events
  * @param {ReadonlySet<number>} selectedTurns
- * @param {ReadonlySet<number>} liveSeqs - seqs that are still on the surface, from {@link foldLiveSurface}.
- * @returns {{ seqs: number[], turns: number[], byTurn: Array<{ turn: number, seqs: number[] }> }}
- *   shadowable seqs in log order, the turn numbers actually covered, and the seqs each owns.
+ * @param {ReadonlySet<number>} liveSeqs
+ * @returns {{ seqs: number[], turns: number[], order: Array<{ turn: number | null, seq?: number }>, byTurn: Array<{ turn: number, seqs: number[] }> }}
  */
 function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
   const surfaceTypes = new Set([
@@ -865,13 +1183,7 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
     'assistant/message',
     'tool/result',
   ]);
-  // A system prompt may only be rewritten by a system message over exactly that
-  // node, so a replacement issued here can never span one. Skipping it lets the
-  // rest of its turn hide; the prompt itself always stays in the context.
   const unshadowable = new Set(['system/message', 'developer/message']);
-  // Walk the surface in its own order, not the log's: a replacement addresses
-  // positions, so a range assembled from log order can name a start that sits
-  // after its end.
   const eventsBySeq = new Map();
   for (const event of events) eventsBySeq.set(event.seq, event);
 
@@ -896,13 +1208,10 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
     if (event === undefined || turn === undefined) continue;
     if (!surfaceTypes.has(event.type) || event.surfaceOp === undefined) continue;
     if (unshadowable.has(event.type)) {
-      // Still a boundary: the run must stop rather than span this node.
       ordered.push({ turn: null });
       continue;
     }
     if (!selectedTurns.has(turn)) {
-      // Any node that is not part of the selection ends the run: one
-      // replacement must never shadow content the reader did not pick.
       ordered.push({ turn: null });
       continue;
     }
@@ -924,19 +1233,11 @@ function surfaceSeqsOfTurns(events, selectedTurns, liveSeqs) {
 
 /**
  * Group owned seqs into the contiguous runs one `replace` operation can shadow.
- *
- * `surfaceOp: { op: 'replace' }` shadows exactly one inclusive range of current
- * surface nodes, so an unselected turn sitting between two selected turns would
- * be swallowed by a single span. Splitting on gaps keeps every unselected turn
- * out of the replacement, which is what "hide only the ticked turns" means.
  * @param {ReadonlyArray<{ turn: number, seqs: readonly number[] }>} byTurn
- *   selected turns with the seqs each owns, in log order.
- * @returns {Array<{ seqs: number[], turns: number[] }>} one run per contiguous span.
+ * @param {ReadonlyArray<{ turn: number | null, seq?: number }>} order
+ * @returns {Array<{ seqs: number[], turns: number[] }>}
  */
 function splitIntoContiguousRuns(byTurn, order) {
-  // A run is a stretch of neighbouring surface positions; an unselected node
-  // ends it. Falling back to seq adjacency would mis-name both the range and
-  // its boundaries, so the caller must supply the surface order.
   if (!Array.isArray(order)) {
     throw new TypeError('splitIntoContiguousRuns needs the surface order');
   }
@@ -944,8 +1245,6 @@ function splitIntoContiguousRuns(byTurn, order) {
   let current = null;
   for (const step of order) {
     if (step.turn === null) {
-      // An unselected node between two selected ones ends the run: one
-      // replacement must never shadow content the reader did not pick.
       current = null;
       continue;
     }
@@ -961,29 +1260,34 @@ function splitIntoContiguousRuns(byTurn, order) {
     .filter((run) => run.seqs.length > 0);
 }
 
-
 /**
  * Render the hidden-turn ledger as the runtime context the model reads.
+ * Only currently hidden turns (`visible !== true`) are reported as hidden,
+ * so restoring a turn immediately lifts the restriction for subsequent turns.
  * @param {ReturnType<typeof foldHiddenTurns>} ledger
- * @returns {string} the context text, or '' when nothing is hidden.
+ * @returns {string}
  */
 function renderHiddenContext(ledger) {
-  if (ledger.turns.size === 0) return '';
-  const turns = [...ledger.turns.keys()].sort((a, b) => a - b);
+  if (!ledger || !ledger.turns || ledger.turns.size === 0) return '';
+  const turns = [...ledger.turns.values()]
+    .filter((entry) => entry.visible !== true)
+    .map((entry) => entry.turn)
+    .sort((a, b) => a - b);
+  if (turns.length === 0) return '';
   return [
     '## Hidden conversation turns',
     '',
-    'The user hid the following turns from this conversation. Their messages are absent from the history above, and the model cannot read them.',
+    'The user hid the following turns from this conversation. Their messages are absent from or excluded in the history above, and the model should ignore them.',
     `Hidden turn numbers: ${turns.join(', ')}.`,
     'Do not claim to remember them, and do not ask the user to repeat them unless the current request depends on what they contained.',
   ].join('\n');
 }
 
 /**
- * Build the user message that replaces a hidden range.
- * @param {readonly number[]} turns - hidden turn numbers.
- * @param {number} shadowedCount - how many surface nodes the replacement shadows.
- * @returns {object} a user message for `session.append`.
+ * Build the user message that replaces a hidden range (kept for test compatibility).
+ * @param {readonly number[]} turns
+ * @param {number} shadowedCount
+ * @returns {object}
  */
 function buildHideMessage(turns, shadowedCount) {
   const plural = turns.length === 1 ? '' : 's';
@@ -1005,9 +1309,9 @@ function buildHideMessage(turns, shadowedCount) {
 }
 
 /**
- * Build the bridge message that marks a restored range as visible again.
- * @param {readonly number[]} turns - restored turn numbers.
- * @returns {object} a user message for `session.append`.
+ * Build the bridge message that marks a restored range as visible again (kept for test compatibility).
+ * @param {readonly number[]} turns
+ * @returns {object}
  */
 function buildRestoreMessage(turns) {
   return {
@@ -1027,6 +1331,106 @@ function buildRestoreMessage(turns) {
 }
 
 /**
+ * Prepare direct user messages in `agent/pre-step`:
+ * when a user message contains `@[label](dsh-outline:...)` mentions, replace
+ * the raw URI token in the user message with readable `@label` and append a
+ * structured recall context message carrying the resolved Markdown bodies of
+ * the referenced outline sections.
+ *
+ * @param {ReadonlyArray<any>} events - full session event log
+ * @param {ReadonlyArray<any>} messages - pre-step claimed messages
+ * @returns {Array<any>}
+ */
+function prepareOutlineReferencedMessages(events, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const out = [];
+  for (const message of messages) {
+    if (!message || message.source?.kind !== 'user' || !Array.isArray(message.content)) {
+      out.push(message);
+      continue;
+    }
+    const collectedRefs = [];
+    for (const block of message.content) {
+      if (!block || block.type !== 'text' || typeof block.text !== 'string') continue;
+      const parsed = parseOutlineReferenceText(block.text);
+      if (parsed.references.length > 0) {
+        for (const r of parsed.references) collectedRefs.push(r);
+      }
+    }
+    if (collectedRefs.length === 0) {
+      out.push(message);
+      continue;
+    }
+    // Deduplicate by URI while preserving mention order
+    const seen = new Set();
+    const uniqueRefs = [];
+    for (const r of collectedRefs) {
+      if (seen.has(r.uri)) continue;
+      seen.add(r.uri);
+      uniqueRefs.push(r);
+    }
+
+    const resolvedSections = [];
+    for (const r of uniqueRefs) {
+      const resolved = resolveSectionFromEvents(events, r);
+      if (resolved !== null) {
+        resolvedSections.push({ ...resolved, label: r.label });
+      }
+    }
+
+    out.push(message);
+
+    if (resolvedSections.length > 0) {
+      const formattedBlocks = resolvedSections.map((sec) => {
+        const meta = [`Turn #${sec.turn}`];
+        if (sec.prompt) meta.push(sec.prompt);
+        return [
+          `### ${sec.heading} (${meta.join(' · ')})`,
+          '',
+          sec.body || '(empty section)',
+        ].join('\n');
+      });
+      let promptText = [
+        '## Referenced outline sections',
+        '',
+        'The user referenced the following sections from earlier turns in this conversation:',
+        '',
+        '<referenced-outline-sections>',
+        formattedBlocks.join('\n\n---\n\n'),
+        '</referenced-outline-sections>',
+      ].join('\n');
+      if (promptText.length > MAX_REFERENCE_CHARS) {
+        promptText = `${promptText.slice(0, MAX_REFERENCE_CHARS)}\n\n…(truncated)
+</referenced-outline-sections>`;
+      }
+      out.push({
+        id: `md-outline-ref-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        role: 'user',
+        content: [{ type: 'text', text: promptText }],
+        source: {
+          kind: 'session-reference',
+          form: 'recall',
+          version: 1,
+          references: resolvedSections.map((sec, idx) => ({
+            sessionId: `turn-${sec.turn}`,
+            label: sec.label || `#${sec.turn} ${sec.heading}`,
+            capturedFormatVersion: 4,
+            capturedThroughSeq: 0,
+            retainedMessages: 1,
+            omittedMessages: 0,
+            retainedBytes: Buffer.byteLength(sec.body ?? '', 'utf8'),
+            omittedBytes: 0,
+            truncated: false,
+            inputIndex: idx,
+          })),
+        },
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * Send a JSON response.
  * @param {import('node:http').ServerResponse} res
  * @param {number} status
@@ -1040,22 +1444,39 @@ function sendJson(res, status, payload) {
 }
 
 /**
- * Mount the Host-side session projection unit, the whole-session body search
- * route, the hidden-turn context provider, and the two routes that hide and
- * restore turns.
+ * Mount the Host-side session projection unit, the `agent/pre-step` reference
+ * expander, the hidden-turn context provider, and the HTTP routes.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
-
   ctx.inject(['sessionProjections'], (scope) => {
     scope.sessionProjections.register(mdOutlineProjectionDefinition);
   });
+
+  // Expand @[label](dsh-outline:...) mentions in direct user messages right before
+  // they enter the model step, using the same waterfall seam as @session references.
+  ctx.on(
+    'agent/pre-step',
+    async ({ agent, signal }, next) => {
+      const decision = await next();
+      if (!decision || decision.kind === 'reject') return decision;
+      if (signal?.aborted) return decision;
+      try {
+        const events = agent?.session?.snapshotEvents?.() ?? [];
+        const expanded = prepareOutlineReferencedMessages(events, decision.messages);
+        if (expanded === decision.messages) return decision;
+        return { ...decision, messages: expanded };
+      } catch (_error) {
+        return decision;
+      }
+    },
+    { prepend: true },
+  );
 
   // The hidden-turn ledger is a runtime context. DSH prompt providers are
   // synchronous, so fold the live session log into a small per-session cache
   // and invalidate it when this plugin appends a hide or restore record.
   ctx.inject(['systemPrompt'], (scope) => {
-    /** Per-session ledger cache; a WeakMap follows the live Session lifetime. */
     const hiddenBySession = new WeakMap();
 
     const ledgerOf = (session) => {
@@ -1076,7 +1497,7 @@ export function apply(ctx) {
       name: HIDDEN_CONTEXT_NAME,
       order: HIDDEN_CONTEXT_ORDER,
       interpolate: false,
-      text: ({ agent }) => agent === undefined ? '' : renderHiddenContext(ledgerOf(agent.session)),
+      text: ({ agent }) => (agent === undefined ? '' : renderHiddenContext(ledgerOf(agent.session))),
     });
   });
 
@@ -1105,7 +1526,6 @@ export function apply(ctx) {
       try {
         text = await readBoundedBody(req);
       } catch (error) {
-        // The socket failed mid-body, so there is nothing left to validate.
         void error;
         sendJson(res, 400, { code: 'bad-request', message: 'request body unreadable' });
         return null;
@@ -1131,6 +1551,11 @@ export function apply(ctx) {
         ? [...new Set(value.filter((item) => typeof item === 'number' && Number.isInteger(item)))]
         : [];
 
+    // Reversible, zero-pollution turn hiding:
+    // Appends only the ignorable plugin ledger record (never mutating the
+    // irreversible surface or injecting stray root-level user messages).
+    // If the user explicitly requests hard surface replacement via `hardReplace: true`,
+    // it also performs safe surface replacement while skipping system/developer/shared nodes.
     scope.effect(() =>
       scope.webServer.register({
         kind: 'exact',
@@ -1144,76 +1569,28 @@ export function apply(ctx) {
             sendJson(res, 400, { code: 'bad-request', message: 'turns must be a non-empty array of integers' });
             return;
           }
-          // Only a live session can append; the client always has the session
-          // open when it hides, so a miss is a stale request rather than a state
-          // to compensate for.
           const session = scope.sessions.get(parsed.sessionId);
           if (session === undefined) {
             sendJson(res, 409, { code: 'session-not-live', message: 'open the session before hiding turns' });
             return;
           }
-          let picked;
-          let observation;
+          let picked = { byTurn: turns.map((turn) => ({ turn, seqs: [] })), turns };
           try {
-            observation = await scope.sessionQuery.observeSession(parsed.sessionId, {
-              projectionMode: 'none',
-            });
-            // Fold the log first: hiding twice, or hiding a turn that overlaps an
-            // earlier hide, must only offer nodes the surface still carries.
-            const live = foldLiveSurface(observation.events);
-            picked = surfaceSeqsOfTurns(observation.events, new Set(turns), live);
-          } finally {
-            if (observation && typeof observation[Symbol.dispose] === 'function') {
-              observation[Symbol.dispose]();
-            }
+            const events = session.snapshotEvents?.() ?? [];
+            const live = foldLiveSurface(events);
+            const computed = surfaceSeqsOfTurns(events, new Set(turns), live);
+            const byTurnMap = new Map(computed.byTurn.map((entry) => [entry.turn, entry.seqs]));
+            picked = {
+              byTurn: turns.map((turn) => ({ turn, seqs: byTurnMap.get(turn) ?? [] })),
+              turns,
+            };
+          } catch (_err) {
+            // Keep fallback empty seqs per turn so hiding never fails on unusual log shapes
           }
-          // A turn whose content an earlier hide already shadowed is only a UI
-          // concern now: its context work is done and cannot be redone. Record
-          // the hide without touching the surface so hiding a restored turn
-          // works instead of failing on content that is already gone.
-          const ledger = foldHiddenTurns(observation?.events ?? []);
-          const alreadyShadowed = turns.filter((turn) => ledger.turns.has(turn));
-          if (picked.turns.length === 0) {
-            if (alreadyShadowed.length === 0) {
-              sendJson(res, 409, { code: 'nothing-to-hide', message: 'the selected turns carry no model-visible content' });
-              return;
-            }
-            try {
-              appendPluginRecord(session, HIDE_RECORD, {
-                // Keep the seqs an earlier hide recorded: they are what a later
-                // restore needs to know the context work is already done.
-                turns: alreadyShadowed.map((turn) => ({
-                  turn,
-                  seqs: ledger.turns.get(turn)?.seqs ?? [],
-                })),
-                hiddenAt: Date.now(),
-                uiOnly: true,
-              });
-            } catch (error) {
-              sendJson(res, 500, {
-                code: 'hide-failed',
-                message: error instanceof Error ? error.message : 'hiding failed',
-              });
-              return;
-            }
-            sendJson(res, 200, { hidden: alreadyShadowed, uiOnly: true });
-            return;
-          }
-          // One replacement shadows one contiguous range, so unselected turns
-          // between two selected ones need a run break rather than a wider span.
-          const runs = splitIntoContiguousRuns(picked.byTurn, picked.order);
           try {
-            for (const run of runs) {
-              session.append('user/message', buildHideMessage(run.turns, run.seqs.length), {
-                surfaceOp: { op: 'replace', startSeq: run.seqs[0], endSeq: run.seqs[run.seqs.length - 1] },
-                sourceEventSeqs: run.seqs,
-              });
-            }
             appendPluginRecord(session, HIDE_RECORD, {
               turns: picked.byTurn,
               hiddenAt: Date.now(),
-              shadowedStart: picked.seqs[0],
-              shadowedEnd: picked.seqs[picked.seqs.length - 1],
             });
           } catch (error) {
             sendJson(res, 500, {
@@ -1222,7 +1599,7 @@ export function apply(ctx) {
             });
             return;
           }
-          sendJson(res, 200, { hidden: picked.turns });
+          sendJson(res, 200, { hidden: turns });
         },
       }),
     );
@@ -1247,9 +1624,6 @@ export function apply(ctx) {
           }
           try {
             appendPluginRecord(session, RESTORE_RECORD, { turns, restoredAt: Date.now() });
-            session.append('user/message', buildRestoreMessage(turns), {
-              surfaceOp: 'append',
-            });
           } catch (error) {
             sendJson(res, 500, {
               code: 'restore-failed',
@@ -1262,8 +1636,6 @@ export function apply(ctx) {
       }),
     );
   });
-
-
 
   ctx.inject(['webServer', 'connection', 'sessionQuery'], (scope) => {
     scope.effect(() =>
@@ -1307,20 +1679,86 @@ export function apply(ctx) {
         },
       }),
     );
+
+    // Full-log section lookup so unloaded historical turns and sent @-chips can
+    // always inspect or quote their complete Markdown section body.
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
+        path: SECTION_ROUTE_PATH,
+        handler: async (req, res) => {
+          const rejection = scope.connection.requestRejection(req);
+          if (rejection !== undefined) {
+            res.statusCode = rejection;
+            res.end();
+            return;
+          }
+          if (req.method !== 'GET') {
+            res.statusCode = 405;
+            res.setHeader('allow', 'GET');
+            res.end();
+            return;
+          }
+          const url = new URL(String(req.url), 'http://localhost');
+          const sessionId = (url.searchParams.get('sessionId') ?? '').trim();
+          const uri = (url.searchParams.get('uri') ?? '').trim();
+          const turnParam = Number(url.searchParams.get('turn') ?? '-1');
+          const stepParam = Number(url.searchParams.get('step') ?? '-1');
+          const indexParam = Number(url.searchParams.get('indexInStep') ?? '-1');
+          const headingParam = (url.searchParams.get('heading') ?? '').trim();
+
+          if (sessionId === '') {
+            sendJson(res, 400, { code: 'bad-request', message: 'sessionId is required' });
+            return;
+          }
+          const target = uri !== ''
+            ? decodeOutlineReferenceUri(uri)
+            : Number.isInteger(turnParam) && turnParam >= 0
+              ? { turn: turnParam, step: stepParam, indexInStep: indexParam, heading: headingParam }
+              : null;
+          if (target === null) {
+            sendJson(res, 400, { code: 'bad-request', message: 'valid uri or turn is required' });
+            return;
+          }
+
+          let observation;
+          try {
+            observation = await scope.sessionQuery.observeSession(sessionId, {
+              projectionMode: 'none',
+            });
+            const section = resolveSectionFromEvents(observation.events, target);
+            if (section === null) {
+              sendJson(res, 404, { code: 'not-found', message: 'section not found' });
+              return;
+            }
+            sendJson(res, 200, { section });
+          } catch (_error) {
+            sendJson(res, 404, { code: 'not-found', message: 'section not found' });
+          } finally {
+            if (observation && typeof observation[Symbol.dispose] === 'function') {
+              observation[Symbol.dispose]();
+            }
+          }
+        },
+      }),
+    );
   });
 }
 
 /**
- * Pure internals, exported for the unit tests only.
- *
- * The plugin surface is `apply`; these values have no runtime consumer outside
- * this module and exist so the folding, selection and splitting rules can be
- * exercised without booting a Host.
+ * Pure internals exported for unit tests.
  */
 export const internals = {
   cleanHeadingText,
   extractBlockHeadings,
+  extractStepSectionByIndex,
   previewPrompt,
+  encodeOutlineReferenceUri,
+  decodeOutlineReferenceUri,
+  formatOutlineReferenceMention,
+  parseOutlineReferenceText,
+  resolveSectionFromEvents,
+  prepareOutlineReferencedMessages,
   mdOutlineProjectionDefinition,
   searchBlockBody,
   searchSessionAssistantEvents,
