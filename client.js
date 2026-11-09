@@ -3083,6 +3083,11 @@ window.__ModuleLoader__.load({
             lastAttachedRef.current = signature;
 
             if (entries.length > 0 && tryInsertAtomicChips(sessionId, entries, inputActions)) {
+              // Once atomic @ reference chips are in the composer, the chips
+              // themselves are the visible UI (clicking any chip opens the
+              // detail drawer), so clear the redundant dock card immediately.
+              lastAttachedRef.current = '';
+              selectionStore.detach();
               return;
             }
 
@@ -3144,8 +3149,9 @@ window.__ModuleLoader__.load({
           const previewItem = selection.preview;
           const sidebarItems = previewItem ? [previewItem] : attached;
 
+          const hasLiveSessionBinding = Boolean(ctx.sessions?.binding?.(sessionId)?.ctx);
           const card =
-            attached.length === 0
+            attached.length === 0 || hasLiveSessionBinding
               ? null
               : h(
                   'div',

@@ -398,7 +398,7 @@ test('confirming a reference inserts atomic ReferenceChipNode via slash/input-in
 
   const dock = client.registered.get('md-outline-reference')
   const writes = []
-  dock({
+  const rendered = dock({
     useSelection: (selector) => selector({
       entries: [],
       attached: [ENTRY],
@@ -424,6 +424,7 @@ test('confirming a reference inserts atomic ReferenceChipNode via slash/input-in
   assert.match(insertedRefs[0].reference.label, /#22 · 第一层：中文连接词规范化/)
   assert.match(insertedRefs[0].reference.clipboardText, /^@\[#22 · 第一层：中文连接词规范化\]\(dsh-outline:/)
   assert.equal(writes.length, 0, 'does not dump raw Markdown into setDraft when atomic chip insertion succeeds')
+  assert.ok(rendered !== undefined)
 })
 
 test('registers md-outline serializer on inputTriggers even when inputTriggers mounts after apply(ctx)', async () => {
