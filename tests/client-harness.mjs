@@ -145,9 +145,14 @@ export function loadClient() {
   if (loadedPlugin === null) throw new Error('client factory did not produce a plugin')
 
   const bailed = []
+  const serviceInjects = []
   let bindingImpl = () => undefined
 
   const ctx = {
+    inject: (deps, callback) => {
+      serviceInjects.push({ deps, callback })
+      return () => {}
+    },
     effect: (fn) => {
       try {
         fn()
@@ -197,6 +202,14 @@ export function loadClient() {
     },
     setBinding: (impl) => {
       bindingImpl = impl
+    },
+    provideLateService: (name, service) => {
+      ctx[name] = service
+      for (const entry of serviceInjects) {
+        if (entry.deps.includes(name)) {
+          entry.callback(ctx)
+        }
+      }
     },
     bailed,
     /** Begin another render of the same mounted tree, reusing its refs. */

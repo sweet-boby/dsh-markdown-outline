@@ -425,3 +425,39 @@ test('confirming a reference inserts atomic ReferenceChipNode via slash/input-in
   assert.match(insertedRefs[0].reference.clipboardText, /^@\[#22 · 第一层：中文连接词规范化\]\(dsh-outline:/)
   assert.equal(writes.length, 0, 'does not dump raw Markdown into setDraft when atomic chip insertion succeeds')
 })
+
+test('registers md-outline serializer on inputTriggers even when inputTriggers mounts after apply(ctx)', async () => {
+  const client = loadClient()
+  const sources = []
+  const rules = []
+  client.provideLateService('inputTriggers', {
+    registerSource: (src) => {
+      sources.push(src)
+      return () => {}
+    },
+  })
+  client.provideLateService('uiConversation', {
+    userText: {
+      register: (rule) => {
+        rules.push(rule)
+        return () => {}
+      },
+    },
+  })
+
+  assert.equal(sources.length, 1, 'registers md-outline trigger source on late inputTriggers')
+  assert.equal(sources[0].name, 'md-outline')
+  assert.equal(sources[0].trigger, '@')
+  assert.equal(typeof sources[0].codec?.serialize, 'function')
+  assert.equal(rules.length, 1, 'registers md-outline userText rule on late uiConversation')
+  assert.equal(rules[0].id, 'md-outline')
+
+  const built = client.internals.buildSectionSelection(
+    { turn: 2, prompt: '可以，按你说的做' },
+    { id: 't2:s1:h0', turn: 2, step: 1, indexInStep: 0, depth: 3, text: '本次完成的改动清单' },
+    [{ turn: 2, step: 1, prompt: '可以，按你说的做', texts: ['### 本次完成的改动清单\n正文内容'] }],
+    [],
+  )
+  const serialized = await sources[0].codec.serialize(built.uri)
+  assert.equal(serialized, `@[#2 · 本次完成的改动清单](${built.uri})`)
+})

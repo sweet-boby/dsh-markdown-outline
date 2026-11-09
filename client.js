@@ -2728,11 +2728,30 @@ window.__ModuleLoader__.load({
           return true;
         };
 
-        // Optional integration with uiConversation.userText so sent messages
-        // render @[label](dsh-outline:...) as clickable inline chips.
-        const uiConversation = ctx.get?.('uiConversation');
-        if (uiConversation?.userText && typeof uiConversation.userText.register === 'function') {
-          ctx.effect(() => uiConversation.userText.register(outlineUserTextRule));
+        // Integration with uiConversation.userText so sent messages render
+        // @[label](dsh-outline:...) as clickable inline chips. Wait via
+        // ctx.inject(['uiConversation'], ...) so stage-2 loading order never
+        // skips registration.
+        let userTextRuleRegistered = false;
+        const ensureUserTextRule = (scope) => {
+          if (userTextRuleRegistered) return true;
+          const uiConversation =
+            scope?.uiConversation ??
+            scope?.get?.('uiConversation') ??
+            ctx.get?.('uiConversation') ??
+            ctx.uiConversation;
+          if (!uiConversation?.userText || typeof uiConversation.userText.register !== 'function') {
+            return false;
+          }
+          userTextRuleRegistered = true;
+          const target = scope ?? ctx;
+          target.effect(() => {
+            const dispose = uiConversation.userText.register(outlineUserTextRule);
+            return () => {
+              userTextRuleRegistered = false;
+              if (typeof dispose === 'function') dispose();
+            };
+          });
           ctx.slots.inject('conversation.user.text.node', () =>
             ctx.slots.register(
               {
@@ -2761,99 +2780,140 @@ window.__ModuleLoader__.load({
               },
             ),
           );
+          return true;
+        };
+
+        ensureUserTextRule(ctx);
+        if (typeof ctx.inject === 'function') {
+          ctx.inject(['uiConversation'], (scope) => {
+            ensureUserTextRule(scope);
+          });
         }
 
-        // Optional integration with inputTriggers so:
+        // Integration with inputTriggers so:
         // 1. Atomic ReferenceChipNode instances in the composer can serialize
         //    and open previews when clicked;
         // 2. Typing `@` in the composer also lists outline headings as candidates!
-        const inputTriggers = ctx.get?.('inputTriggers');
-        if (inputTriggers && typeof inputTriggers.registerSource === 'function') {
-          ctx.effect(() =>
-            inputTriggers.registerSource({
-              trigger: '@',
-              name: 'md-outline',
-              order: 20,
-              showGroupTitle: false,
-              async candidates(_session, { query, quoted }) {
-                if (quoted) return [];
-                const q = (query ?? '').trim().toLowerCase();
-                const out = [];
-                for (const group of bridgeState.groups) {
-                  for (const item of group.items) {
-                    const label = `#${group.turn} · ${item.text}`;
-                    if (q !== '' && !label.toLowerCase().includes(q) && !(group.prompt ?? '').toLowerCase().includes(q)) {
-                      continue;
-                    }
-                    const uri = encodeOutlineReferenceUri({
-                      turn: group.turn,
-                      step: item.step,
-                      indexInStep: item.indexInStep ?? 0,
-                      heading: item.text,
-                    });
-                    const mention = formatOutlineReferenceMention({
-                      turn: group.turn,
-                      heading: item.text,
-                      label,
-                      uri,
-                    });
-                    out.push({
-                      name: label,
-                      description: group.prompt || `第 ${group.turn} 轮回复`,
-                      icon: 'file',
-                      section: '对话目录章节',
-                      value: JSON.stringify({ label, uri, mention }),
-                    });
-                    if (out.length >= 30) break;
-                  }
-                  if (out.length >= 30) break;
+        // Wait via ctx.inject(['inputTriggers'], ...) and also ensure lazily
+        // when slots or chip insertions run so stage-1/stage-2 boot order never
+        // misses the serializer registration.
+        let triggerSourceRegistered = false;
+        const outlineTriggerSource = {
+          trigger: '@',
+          name: 'md-outline',
+          order: 20,
+          showGroupTitle: false,
+          async candidates(_session, { query, quoted }) {
+            if (quoted) return [];
+            const q = (query ?? '').trim().toLowerCase();
+            const out = [];
+            for (const group of bridgeState.groups) {
+              for (const item of group.items) {
+                const label = `#${group.turn} · ${item.text}`;
+                if (q !== '' && !label.toLowerCase().includes(q) && !(group.prompt ?? '').toLowerCase().includes(q)) {
+                  continue;
                 }
-                return out;
-              },
-              onPick({ candidate }) {
-                try {
-                  const parsed = JSON.parse(candidate.value ?? '{}');
-                  if (!parsed.mention) return undefined;
-                  return {
-                    insert: {
-                      source: 'md-outline',
-                      ref: parsed.uri,
-                      label: parsed.label,
-                      appearance: 'file',
-                      clipboardText: parsed.mention,
-                    },
-                  };
-                } catch (_err) {
-                  return undefined;
-                }
-              },
-              openReference(session, { ref }) {
-                return openOutlineReference(session?.sessionId || bridgeState.sessionId, ref, '');
-              },
-              codec: {
-                clipboardText: (ref) => {
-                  const decoded = decodeOutlineReferenceUri(ref);
-                  const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
-                  return formatOutlineReferenceMention({
-                    turn: decoded?.turn ?? 0,
-                    heading: decoded?.heading ?? '',
-                    label,
-                    uri: ref,
-                  });
+                const uri = encodeOutlineReferenceUri({
+                  turn: group.turn,
+                  step: item.step,
+                  indexInStep: item.indexInStep ?? 0,
+                  heading: item.text,
+                });
+                const mention = formatOutlineReferenceMention({
+                  turn: group.turn,
+                  heading: item.text,
+                  label,
+                  uri,
+                });
+                out.push({
+                  name: label,
+                  description: group.prompt || `第 ${group.turn} 轮回复`,
+                  icon: 'file',
+                  section: '对话目录章节',
+                  value: JSON.stringify({ label, uri, mention }),
+                });
+                if (out.length >= 30) break;
+              }
+              if (out.length >= 30) break;
+            }
+            return out;
+          },
+          onPick({ candidate }) {
+            try {
+              const parsed = JSON.parse(candidate.value ?? '{}');
+              if (!parsed.mention) return undefined;
+              return {
+                insert: {
+                  source: 'md-outline',
+                  ref: parsed.uri,
+                  label: parsed.label,
+                  appearance: 'file',
+                  clipboardText: parsed.mention,
                 },
-                serialize: async (ref) => {
-                  const decoded = decodeOutlineReferenceUri(ref);
-                  const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
-                  return formatOutlineReferenceMention({
-                    turn: decoded?.turn ?? 0,
-                    heading: decoded?.heading ?? '',
-                    label,
-                    uri: ref,
-                  });
-                },
-              },
-            }),
-          );
+              };
+            } catch (_err) {
+              return undefined;
+            }
+          },
+          openReference(session, { ref }) {
+            return openOutlineReference(session?.sessionId || bridgeState.sessionId, ref, '');
+          },
+          codec: {
+            clipboardText: (ref) => {
+              const decoded = decodeOutlineReferenceUri(ref);
+              const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
+              return formatOutlineReferenceMention({
+                turn: decoded?.turn ?? 0,
+                heading: decoded?.heading ?? '',
+                label,
+                uri: ref,
+              });
+            },
+            serialize: async (ref) => {
+              const decoded = decodeOutlineReferenceUri(ref);
+              const label = decoded?.heading ? `#${decoded.turn} · ${decoded.heading}` : ref;
+              return formatOutlineReferenceMention({
+                turn: decoded?.turn ?? 0,
+                heading: decoded?.heading ?? '',
+                label,
+                uri: ref,
+              });
+            },
+          },
+        };
+
+        const ensureInputTriggerSource = (scope) => {
+          if (triggerSourceRegistered) return true;
+          const inputTriggers =
+            scope?.inputTriggers ??
+            scope?.get?.('inputTriggers') ??
+            ctx.get?.('inputTriggers') ??
+            ctx.inputTriggers;
+          if (!inputTriggers || typeof inputTriggers.registerSource !== 'function') {
+            return false;
+          }
+          triggerSourceRegistered = true;
+          const target = scope ?? ctx;
+          target.effect(() => {
+            let dispose;
+            try {
+              dispose = inputTriggers.registerSource(outlineTriggerSource);
+            } catch (_err) {
+              // Already registered on this InputTriggerService instance.
+            }
+            return () => {
+              triggerSourceRegistered = false;
+              if (typeof dispose === 'function') dispose();
+            };
+          });
+          return true;
+        };
+
+        ensureInputTriggerSource(ctx);
+        if (typeof ctx.inject === 'function') {
+          ctx.inject(['inputTriggers'], (scope) => {
+            ensureInputTriggerSource(scope);
+          });
         }
 
         let transcriptSheet = null;
@@ -2931,6 +2991,8 @@ window.__ModuleLoader__.load({
           if (!actx || typeof actx.bail !== 'function' || typeof inputActions?.captureInsertion !== 'function') {
             return false;
           }
+          ensureInputTriggerSource(actx);
+          ensureUserTextRule(actx);
           // Replace any previously attached md-outline chips by stripping their
           // clipboard mentions first if needed, then inserting each chip at the caret.
           let anyInserted = false;
@@ -2977,6 +3039,13 @@ window.__ModuleLoader__.load({
           }, [notice]);
 
           useEffect(() => {
+            ensureInputTriggerSource(ctx);
+            ensureUserTextRule(ctx);
+            const binding = ctx.sessions?.binding?.(sessionId);
+            if (binding?.ctx) {
+              ensureInputTriggerSource(binding.ctx);
+              ensureUserTextRule(binding.ctx);
+            }
             selectionStore.reset();
             hiddenStore.clear();
             return () => {
@@ -4632,8 +4701,10 @@ window.__ModuleLoader__.load({
           ),
         );
 
-        ctx.slots.inject('conversation.input.dock', () =>
-          ctx.slots.register(
+        ctx.slots.inject('conversation.input.dock', () => {
+          ensureInputTriggerSource(ctx);
+          ensureUserTextRule(ctx);
+          return ctx.slots.register(
             {
               name: 'conversation.input.dock',
               id: 'md-outline-reference',
@@ -4647,8 +4718,8 @@ window.__ModuleLoader__.load({
               }),
             },
             ReferenceDock,
-          ),
-        );
+          );
+        });
       },
     };
   },
