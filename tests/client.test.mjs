@@ -427,7 +427,7 @@ test('confirming a reference inserts atomic ReferenceChipNode via slash/input-in
 })
 
 test('registers md-outline serializer on inputTriggers even when inputTriggers mounts after apply(ctx)', async () => {
-  const client = loadClient()
+  const client = loadClient({ strictServices: true })
   const sources = []
   const rules = []
   client.provideLateService('inputTriggers', {

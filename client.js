@@ -2735,11 +2735,7 @@ window.__ModuleLoader__.load({
         let userTextRuleRegistered = false;
         const ensureUserTextRule = (scope) => {
           if (userTextRuleRegistered) return true;
-          const uiConversation =
-            scope?.uiConversation ??
-            scope?.get?.('uiConversation') ??
-            ctx.get?.('uiConversation') ??
-            ctx.uiConversation;
+          const uiConversation = (scope ?? ctx).get?.('uiConversation');
           if (!uiConversation?.userText || typeof uiConversation.userText.register !== 'function') {
             return false;
           }
@@ -2884,11 +2880,7 @@ window.__ModuleLoader__.load({
 
         const ensureInputTriggerSource = (scope) => {
           if (triggerSourceRegistered) return true;
-          const inputTriggers =
-            scope?.inputTriggers ??
-            scope?.get?.('inputTriggers') ??
-            ctx.get?.('inputTriggers') ??
-            ctx.inputTriggers;
+          const inputTriggers = (scope ?? ctx).get?.('inputTriggers');
           if (!inputTriggers || typeof inputTriggers.registerSource !== 'function') {
             return false;
           }

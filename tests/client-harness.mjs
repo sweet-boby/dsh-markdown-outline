@@ -83,11 +83,13 @@ function createReactStub() {
 
 /**
  * Load the client plugin under a fake DOM.
+ * @param {{ strictServices?: boolean }} options - reject direct reads of optional
+ *   services that were not injected, matching Cordis's context proxy.
  * @returns {{ plugin: object, registered: Map<string, Function>, head: object[], rendered: string[] }}
  *   the plugin, its slot registrations, the style elements it appended, and the
  *   component names it rendered.
  */
-export function loadClient() {
+export function loadClient({ strictServices = false } = {}) {
   const { React, rendered, nodes } = createReactStub()
   const head = []
   const registered = new Map()
@@ -148,7 +150,8 @@ export function loadClient() {
   const serviceInjects = []
   let bindingImpl = () => undefined
 
-  const ctx = {
+  const serviceTarget = {
+    get: (name) => serviceTarget[name],
     inject: (deps, callback) => {
       serviceInjects.push({ deps, callback })
       return () => {}
@@ -187,6 +190,16 @@ export function loadClient() {
       },
     },
   }
+  const ctx = strictServices
+    ? new Proxy(serviceTarget, {
+        get(target, prop, receiver) {
+          if ((prop === 'uiConversation' || prop === 'inputTriggers') && !Reflect.has(target, prop)) {
+            throw new Error(`cannot get property "${String(prop)}" without inject`)
+          }
+          return Reflect.get(target, prop, receiver)
+        },
+      })
+    : serviceTarget
   loadedPlugin.apply(ctx)
 
   return {
@@ -204,7 +217,7 @@ export function loadClient() {
       bindingImpl = impl
     },
     provideLateService: (name, service) => {
-      ctx[name] = service
+      serviceTarget[name] = service
       for (const entry of serviceInjects) {
         if (entry.deps.includes(name)) {
           entry.callback(ctx)
