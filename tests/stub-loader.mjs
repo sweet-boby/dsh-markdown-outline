@@ -13,6 +13,7 @@ import { pathToFileURL } from 'node:url'
 
 const STUBS = {
   '@deepseek-ai/dsh-session': pathToFileURL(new URL('./stub-dsh-session.mjs', import.meta.url).pathname).href,
+  '@deepseek-ai/dsh-session/repair': pathToFileURL(new URL('./stub-dsh-session.mjs', import.meta.url).pathname).href,
 }
 
 /**

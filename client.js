@@ -44,6 +44,7 @@ window.__ModuleLoader__.load({
     const OUTLINE_REFERENCE_SCHEME = 'dsh-outline:';
     const HIDE_ROUTE = 'md-outline/hide';
     const RESTORE_ROUTE = 'md-outline/restore';
+    const FORK_TURNS_ROUTE = 'md-outline/fork-turns';
     const DEFAULT_WIDTH = 252;
     const MIN_WIDTH = 180;
     const MAX_WIDTH = 420;
@@ -98,6 +99,14 @@ window.__ModuleLoader__.load({
       hideFailed: 'Could not hide turns: {message}',
       restoreFailed: 'Could not restore the turn: {message}',
       hiddenBadge: 'hidden',
+      forkButton: 'New session',
+      forkTurns: 'Create new session from {count} turns',
+      forkTurnsExplain:
+        'Creates a new session in this workspace and copies the complete conversation history of the selected turns (prompts, AI replies, and tool results) into it.',
+      forkTitlePlaceholder: 'Optional: new session title…',
+      forkConfirm: 'Create & open',
+      forking: 'Creating…',
+      forkFailed: 'Could not create session: {message}',
     };
 
     const ZH_DICT = {
@@ -143,6 +152,14 @@ window.__ModuleLoader__.load({
       hideFailed: '隐藏失败：{message}',
       restoreFailed: '恢复失败：{message}',
       hiddenBadge: '已隐藏',
+      forkButton: '新建会话',
+      forkTurns: '从已选的 {count} 个轮次创建新会话',
+      forkTurnsExplain:
+        '将在当前工作区创建一个新会话，并把所选轮次的完整对话历史（提问、AI 回复与工具结果）按顺序放入新会话中，原会话保持不变。',
+      forkTitlePlaceholder: '可选：自定义新会话标题（留空自动生成）…',
+      forkConfirm: '创建并跳转',
+      forking: '正在创建…',
+      forkFailed: '创建新会话失败：{message}',
     };
 
     const STYLESHEET = `
@@ -871,11 +888,11 @@ window.__ModuleLoader__.load({
 
 .dsh-mdo-hide-bar {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   flex: none;
   box-sizing: border-box;
-  min-height: 44px;
   padding: 8px 10px;
   border-top: 0.5px solid var(--dsw-alias-border-l1);
   background: var(--dsw-alias-bg-layer-1, var(--dsw-alias-bg-base));
@@ -885,15 +902,31 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary);
 }
 
-/* The hide action shares the bar with its count; keep the button compact so a
-   narrow column never clips it. */
+.dsh-mdo-hide-bar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dsh-mdo-hide-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
 .dsh-mdo-hide-bar .dsh-mdo-btn {
-  flex: none;
+  flex: 1 1 0;
+  min-width: 0;
   height: 26px;
-  padding: 0 10px;
+  padding: 0 6px;
   font-size: 11px;
   line-height: 16px;
   border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dsh-mdo-hide-bar-text {
@@ -957,10 +990,53 @@ window.__ModuleLoader__.load({
 }
 
 .dsh-mdo-confirm-text {
-  margin: 0 0 20px 0;
+  margin: 0 0 14px 0;
   font-size: 13px;
   line-height: 20px;
   color: var(--dsw-alias-label-secondary);
+}
+
+.dsh-mdo-confirm-turns {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+  margin: 0 0 14px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-base);
+}
+
+.dsh-mdo-confirm-turn-item {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dsh-mdo-confirm-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 34px;
+  margin: 0 0 18px 0;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 20px;
+  outline: none;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.dsh-mdo-confirm-input:focus {
+  border-color: var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, var(--dsw-alias-brand-primary)) 14%, transparent);
 }
 
 .dsh-mdo-confirm-actions {
@@ -2641,6 +2717,7 @@ window.__ModuleLoader__.load({
         selecting: false,
         sidebarOpen: false,
         confirmIds: null,
+        forkIds: null,
         preview: null,
       };
       const listeners = new Set();
@@ -2686,7 +2763,7 @@ window.__ModuleLoader__.load({
         openPreview: (preview) => write({ ...state, preview, sidebarOpen: true }),
         closePreview: () => write({ ...state, preview: null, sidebarOpen: false }),
         detach: () => write({ ...state, attached: [], sidebarOpen: false, preview: null }),
-        requestHide: (ids) => write({ ...state, confirmIds: ids }),
+        requestHide: (ids) => write({ ...state, confirmIds: ids, forkIds: null }),
         cancelHide: () => write({ ...state, confirmIds: null }),
         finishHide: (ids) => write({
           ...state,
@@ -2694,12 +2771,21 @@ window.__ModuleLoader__.load({
           selecting: false,
           entries: state.entries.filter((it) => !ids.has(it.id)),
         }),
+        requestFork: (ids) => write({ ...state, forkIds: ids, confirmIds: null }),
+        cancelFork: () => write({ ...state, forkIds: null }),
+        finishFork: () => write({
+          ...state,
+          forkIds: null,
+          selecting: false,
+          entries: [],
+        }),
         reset: () => write({
           entries: [],
           attached: [],
           selecting: false,
           sidebarOpen: false,
           confirmIds: null,
+          forkIds: null,
           preview: null,
         }),
       };
@@ -3127,6 +3213,8 @@ window.__ModuleLoader__.load({
           const liveDraft = useInput((s) => s.draft);
           const inputPhase = useInput((s) => s.phase);
           const [busy, setBusy] = useState(false);
+          const [forking, setForking] = useState(false);
+          const [forkTitle, setForkTitle] = useState('');
           const [notice, setNotice] = useState(null);
           const lastAttachedRef = useRef(null);
           const draftRef = useRef(liveDraft);
@@ -3245,6 +3333,7 @@ window.__ModuleLoader__.load({
           }, [applyHidden]);
 
           const confirmIds = selection.confirmIds;
+          const forkIds = selection.forkIds;
           const selectedTurns = useMemo(() => {
             if (confirmIds === null) return [];
             const all = new Set();
@@ -3253,6 +3342,68 @@ window.__ModuleLoader__.load({
             }
             return [...all].sort((a, b) => a - b);
           }, [confirmIds, selection.entries]);
+
+          const forkTurnsList = useMemo(() => {
+            if (forkIds === null) return [];
+            const byTurn = new Map();
+            for (const entry of selection.entries) {
+              if (forkIds.has(entry.id) && !byTurn.has(entry.turn)) {
+                byTurn.set(entry.turn, {
+                  turn: entry.turn,
+                  prompt: entry.prompt || '',
+                  heading: entry.heading || '',
+                });
+              }
+            }
+            return [...byTurn.values()].sort((a, b) => a.turn - b.turn);
+          }, [forkIds, selection.entries]);
+
+          useEffect(() => {
+            if (forkIds === null) {
+              setForkTitle('');
+            }
+          }, [forkIds]);
+
+          const applyForkTurns = useCallback(async () => {
+            if (forking || forkTurnsList.length === 0) return;
+            setForking(true);
+            try {
+              const turns = forkTurnsList.map((item) => item.turn);
+              const { ok, body } = await postRoute(FORK_TURNS_ROUTE, {
+                sessionId,
+                turns,
+                ...(forkTitle.trim() === '' ? {} : { title: forkTitle.trim() }),
+              });
+              if (!ok || typeof body?.sessionId !== 'string') {
+                const message = typeof body?.message === 'string' ? body.message : 'unexpected failure';
+                setNotice({ text: t('forkFailed', { message }) });
+                return;
+              }
+              const newSessionId = body.sessionId;
+              selectionStore.finishFork();
+              // Ensure the client session list and workspace list reflect the new session, then navigate to it
+              try {
+                await ctx.sessions?.refresh?.();
+              } catch (_err) {
+                // Non-fatal
+              }
+              try {
+                const workspaces = ctx.get?.('workspaces');
+                await workspaces?.refresh?.();
+              } catch (_err) {
+                // Non-fatal
+              }
+              const uiWorkspace = ctx.get?.('uiWorkspace');
+              if (uiWorkspace && typeof uiWorkspace.openSession === 'function') {
+                uiWorkspace.openSession(newSessionId);
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              setNotice({ text: t('forkFailed', { message }) });
+            } finally {
+              setForking(false);
+            }
+          }, [forking, forkTurnsList, forkTitle, sessionId, t]);
 
           const attached = selection.attached;
           const previewItem = selection.preview;
@@ -3425,6 +3576,93 @@ window.__ModuleLoader__.load({
                 ),
               );
 
+          const forkDialog = forkIds === null
+            ? null
+            : renderOverlay(
+                h(
+                  React.Fragment,
+                  null,
+                  h('div', {
+                    className: 'dsh-mdo-confirm-scrim',
+                    onClick: () => {
+                      if (!forking) selectionStore.cancelFork();
+                    },
+                  }),
+                  h(
+                    'div',
+                    { className: 'dsh-mdo-confirm', role: 'dialog', 'aria-modal': 'true' },
+                    h(
+                      'div',
+                      { className: 'dsh-mdo-confirm-title' },
+                      t('forkTurns', { count: forkTurnsList.length }),
+                    ),
+                    h('p', { className: 'dsh-mdo-confirm-text' }, t('forkTurnsExplain')),
+                    forkTurnsList.length > 0
+                      ? h(
+                          'div',
+                          { className: 'dsh-mdo-confirm-turns' },
+                          forkTurnsList.map((item) =>
+                            h(
+                              'div',
+                              { key: item.turn, className: 'dsh-mdo-confirm-turn-item' },
+                              item.prompt
+                                ? `#${item.turn} · ${item.prompt}`
+                                : item.heading
+                                  ? `#${item.turn} · ${item.heading}`
+                                  : t('turnLabel', { turn: item.turn }),
+                            ),
+                          ),
+                        )
+                      : null,
+                    h('input', {
+                      type: 'text',
+                      className: 'dsh-mdo-confirm-input',
+                      value: forkTitle,
+                      placeholder: t('forkTitlePlaceholder'),
+                      'aria-label': t('forkTitlePlaceholder'),
+                      disabled: forking,
+                      onChange: (e) => setForkTitle(e.target.value),
+                      onKeyDown: (e) => {
+                        if (e.key === 'Enter' && !forking && forkTurnsList.length > 0) {
+                          e.preventDefault();
+                          void applyForkTurns();
+                        } else if (e.key === 'Escape' && !forking) {
+                          e.stopPropagation();
+                          selectionStore.cancelFork();
+                        }
+                      },
+                    }),
+                    h(
+                      'div',
+                      { className: 'dsh-mdo-confirm-actions' },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-mdo-btn',
+                          disabled: forking,
+                          onClick: () => selectionStore.cancelFork(),
+                        },
+                        t('hideCancel'),
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dsh-mdo-btn',
+                          'data-primary': 'true',
+                          disabled: forking || forkTurnsList.length === 0,
+                          onClick: () => {
+                            void applyForkTurns();
+                          },
+                        },
+                        forking ? t('forking') : t('forkConfirm'),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+
           const noticeLine = notice === null
             ? null
             : h(
@@ -3433,7 +3671,7 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'dsh-mdo-hide-bar-text' }, notice.text),
               );
 
-          if (card === null && sidebar === null && confirmDialog === null && noticeLine === null) {
+          if (card === null && sidebar === null && confirmDialog === null && forkDialog === null && noticeLine === null) {
             return null;
           }
 
@@ -3443,6 +3681,7 @@ window.__ModuleLoader__.load({
             card,
             sidebarOverlay,
             confirmDialog,
+            forkDialog,
             noticeLine,
           );
         }
@@ -4705,35 +4944,57 @@ window.__ModuleLoader__.load({
                         'div',
                         { className: 'dsh-mdo-hide-bar' },
                         h(
-                          'span',
-                          { className: 'dsh-mdo-hide-bar-text' },
-                          selection.entries.length === 0
-                            ? t('selectMode')
-                            : t('selectedCount', { count: selection.entries.length }),
+                          'div',
+                          { className: 'dsh-mdo-hide-bar-top' },
+                          h(
+                            'span',
+                            { className: 'dsh-mdo-hide-bar-text' },
+                            selection.entries.length === 0
+                              ? t('selectMode')
+                              : t('selectedCount', { count: selection.entries.length }),
+                          ),
                         ),
                         h(
-                          'button',
-                          {
-                            type: 'button',
-                            className: 'dsh-mdo-btn',
-                            disabled: selection.entries.length === 0,
-                            onClick: () => selectionStore.requestHide(
-                              new Set(selection.entries.map((it) => it.id)),
-                            ),
-                          },
-                          t('hideConfirm'),
-                        ),
-                        h(
-                          'button',
-                          {
-                            type: 'button',
-                            className: 'dsh-mdo-btn',
-                            'data-primary': 'true',
-                            disabled: selection.entries.length === 0,
-                            title: t('confirmReference'),
-                            onClick: () => selectionStore.attachEntries(),
-                          },
-                          t('confirmReference'),
+                          'div',
+                          { className: 'dsh-mdo-hide-bar-actions' },
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-mdo-btn',
+                              disabled: selection.entries.length === 0,
+                              title: t('hideConfirm'),
+                              onClick: () => selectionStore.requestHide(
+                                new Set(selection.entries.map((it) => it.id)),
+                              ),
+                            },
+                            t('hideConfirm'),
+                          ),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-mdo-btn',
+                              disabled: selection.entries.length === 0,
+                              title: t('forkButton'),
+                              onClick: () => selectionStore.requestFork(
+                                new Set(selection.entries.map((it) => it.id)),
+                              ),
+                            },
+                            t('forkButton'),
+                          ),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-mdo-btn',
+                              'data-primary': 'true',
+                              disabled: selection.entries.length === 0,
+                              title: t('confirmReference'),
+                              onClick: () => selectionStore.attachEntries(),
+                            },
+                            t('confirmReference'),
+                          ),
                         ),
                       )
                     : null,

@@ -462,3 +462,19 @@ test('registers md-outline serializer on inputTriggers even when inputTriggers m
   const serialized = await sources[0].codec.serialize(built.uri)
   assert.equal(serialized, `@[#2 · 本次完成的改动清单](${built.uri})`)
 })
+
+test('requestFork opens the fork confirmation state and finishFork clears the selection', () => {
+  const { internals } = loadClient()
+  const store = internals.createSelectionStore()
+
+  store.toggleEntry(ENTRY)
+  store.requestFork(new Set([ENTRY.id]))
+  assert.ok(store.read().forkIds instanceof Set)
+  assert.equal(store.read().forkIds.has(ENTRY.id), true)
+  assert.equal(store.read().confirmIds, null)
+
+  store.finishFork()
+  assert.equal(store.read().forkIds, null)
+  assert.equal(store.read().selecting, false)
+  assert.deepEqual(store.read().entries, [])
+})

@@ -16,6 +16,7 @@
   - 发送后，聊天气泡内同样渲染为可点击的引用胶囊，点击输入框内或已发送消息中的胶囊即可在右侧详情栏查看该章节完整内容（包括未加载的历史轮次）；
   - 宿主侧在 `agent/pre-step` 阶段自动将引用芯片展开为结构化的 `recall` 上下文消息发送给大模型。
 - **隐藏与恢复轮次。** 勾选不再想展示或给模型看的轮次并隐藏，它们会从目录栏、聊天区和模型提示词上下文中消失，同时保留在目录下方的折叠列表里，随时可以一键恢复（完全可逆，且不在聊天区产生任何多余消息）。
+- **从已选轮次创建新会话。** 在多选模式下勾选需要的任意轮次（支持跨轮次非连续勾选），点击**新建会话**即可在当前工作区创建一个只包含所选轮次完整对话历史的新会话并自动跳转。
 - **跟随主题。** 只使用 `--dsw-alias-*` 设计令牌，深色与浅色主题下无需独立配色。
 
 ## 安装
@@ -37,7 +38,7 @@ bundle 会向 profile patch 插入一行 `md-outline`，卸载本包时该行一
 ## 运行要求
 
 - DSH 0.2 及以上，Web 或桌面端。
-- 宿主侧注册 `mdOutline` 会话投影、`agent/pre-step` 引用展开器、`GET /md-outline/search` 与 `GET /md-outline/section` 检索路由，以及 `POST /md-outline/hide`、`POST /md-outline/restore` 两条隐藏/恢复路由。
+- 宿主侧注册 `mdOutline` 会话投影、`agent/pre-step` 引用展开器、`GET /md-outline/search` 与 `GET /md-outline/section` 检索路由，以及 `POST /md-outline/hide`、`POST /md-outline/restore`、`POST /md-outline/fork-turns` 路由。
 
 ## 测试
 

@@ -593,3 +593,126 @@ test('restoring a hidden turn removes it from renderHiddenContext so the model c
   appendRestoreRecord(log, [2], RESTORE_RECORD)
   assert.equal(renderHiddenContext(foldHiddenTurns(log)), '')
 })
+
+test('buildSelectedTurnsSeed extracts non-contiguous turns, renumbers turns and seqs contiguously, and preserves system head', () => {
+  const { buildSelectedTurnsSeed } = internals
+  const log = [
+    { type: 'agent-preset/selected', seq: 0, time: 10, data: { agentPreset: 'opus-ptc' } },
+    { type: 'turn/start', seq: 1, time: 11, data: { turn: 1 } },
+    { type: 'step/start', seq: 2, time: 12, data: { turn: 1, step: 1 } },
+    {
+      type: 'system/message',
+      seq: 3,
+      time: 13,
+      data: {
+        turn: 1,
+        step: 1,
+        message: { id: 'sys-0', role: 'system', content: [{ type: 'text', text: 'System Prompt' }], source: { kind: 'system-prompt' } },
+      },
+      surfaceOp: 'append',
+    },
+    {
+      type: 'request/header',
+      seq: 4,
+      time: 14,
+      data: { reason: 'initial', header: { config: { provider: 'qimao', model: 'gemini-4-argon-high' } } },
+    },
+    {
+      type: 'user/message',
+      seq: 5,
+      time: 15,
+      data: { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Turn 1 prompt' }], source: { kind: 'user' } },
+      surfaceOp: 'append',
+    },
+    {
+      type: 'assistant/message',
+      seq: 6,
+      time: 16,
+      data: {
+        turn: 1,
+        step: 1,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: '## Turn 1 reply' }], source: { kind: 'model', provider: 'qimao', model: 'gemini-4-argon-high' } },
+        stream: [],
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'step/end', seq: 7, time: 17, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 8, time: 18, data: { turn: 1, reason: { kind: 'completed' } } },
+    // Turn 2 (not selected)
+    { type: 'turn/start', seq: 9, time: 20, data: { turn: 2 } },
+    { type: 'step/start', seq: 10, time: 21, data: { turn: 2, step: 1 } },
+    {
+      type: 'user/message',
+      seq: 11,
+      time: 22,
+      data: { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Turn 2 prompt' }], source: { kind: 'user' } },
+      surfaceOp: 'append',
+    },
+    {
+      type: 'assistant/message',
+      seq: 12,
+      time: 23,
+      data: {
+        turn: 2,
+        step: 1,
+        message: { id: 'a-2', role: 'assistant', content: [{ type: 'text', text: '## Turn 2 reply' }], source: { kind: 'model', provider: 'qimao', model: 'gemini-4-argon-high' } },
+        stream: [],
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'step/end', seq: 13, time: 24, data: { turn: 2, step: 1 } },
+    { type: 'turn/end', seq: 14, time: 25, data: { turn: 2, reason: { kind: 'completed' } } },
+    // Turn 3 (selected)
+    { type: 'turn/start', seq: 15, time: 30, data: { turn: 3 } },
+    { type: 'step/start', seq: 16, time: 31, data: { turn: 3, step: 1 } },
+    {
+      type: 'user/message',
+      seq: 17,
+      time: 32,
+      data: { id: 'u-3', role: 'user', content: [{ type: 'text', text: 'Turn 3 prompt' }], source: { kind: 'user' } },
+      surfaceOp: 'append',
+    },
+    {
+      type: 'assistant/message',
+      seq: 18,
+      time: 33,
+      data: {
+        turn: 3,
+        step: 1,
+        message: { id: 'a-3', role: 'assistant', content: [{ type: 'text', text: '## Turn 3 reply' }], source: { kind: 'model', provider: 'qimao', model: 'gemini-4-argon-high' } },
+        stream: [],
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'step/end', seq: 19, time: 34, data: { turn: 3, step: 1 } },
+    { type: 'turn/end', seq: 20, time: 35, data: { turn: 3, reason: { kind: 'completed' } } },
+  ]
+
+  // Select only turn 3 (skipping turn 1 and turn 2): must still synthesize
+  // the protected system prompt and initial request/header into mapped turn 1!
+  const single = buildSelectedTurnsSeed(log, [3])
+  assert.deepEqual(single.selectedTurns, [3])
+  assert.equal(single.firstPrompt, 'Turn 3 prompt')
+  for (let i = 0; i < single.seed.length; i++) {
+    assert.equal(single.seed[i].seq, i, 'every seed event has contiguous seq from 0')
+  }
+  const sysEvents = single.seed.filter((e) => e.type === 'system/message')
+  assert.equal(sysEvents.length, 1, 'preserves the protected system head even when turn 1 was not selected')
+  assert.equal(sysEvents[0].data.turn, 1)
+  const turnStarts = single.seed.filter((e) => e.type === 'turn/start')
+  assert.deepEqual(turnStarts.map((e) => e.data.turn), [1], 'renumbers turn 3 to turn 1')
+  assert.equal(single.seed[single.inheritedEventCount]?.type, 'session/end-seed')
+  assert.equal(single.seed[single.inheritedEventCount]?.data?.inherited, true)
+
+  // Select turns 1 and 3: renumbers to [1, 2] and excludes turn 2
+  const multi = buildSelectedTurnsSeed(log, [1, 3])
+  assert.deepEqual(multi.selectedTurns, [1, 3])
+  assert.deepEqual(
+    multi.seed.filter((e) => e.type === 'turn/start').map((e) => e.data.turn),
+    [1, 2],
+  )
+  const prompts = multi.seed
+    .filter((e) => e.type === 'user/message' && e.data?.source?.kind === 'user')
+    .map((e) => e.data.content[0].text)
+  assert.deepEqual(prompts, ['Turn 1 prompt', 'Turn 3 prompt'])
+})

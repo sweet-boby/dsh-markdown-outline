@@ -16,6 +16,7 @@ A Feishu-style Markdown outline for [DeepSeek Harness](https://github.com/deepse
   - Sent messages render `@[label](dsh-outline:...)` mentions as interactive inline chips via `uiConversation.userText`; clicking a chip in either the composer or a sent message bubble opens the section detail drawer (fetching unloaded history from the Host on demand);
   - On the Host, an `agent/pre-step` waterfall listener expands every `dsh-outline:` mention into a structured `recall` context message carrying the full Markdown section body.
 - **Reversible hidden turns.** Select turns you want to hide from the conversation and model context. Hidden turns are recorded in an ignorable plugin ledger and can be restored cleanly at any time without polluting the transcript.
+- **Create new session from selected turns.** Tick any combination of turns (even non-contiguous ones) and click **New session** to branch a brand-new Session in the same Workspace containing only the complete conversation history of those selected turns.
 - **Theme-native.** Only `--dsw-alias-*` tokens are used, so the outline follows the light and dark theme without its own palette.
 
 ## Install

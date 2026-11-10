@@ -15,9 +15,12 @@
  *    - `GET  /md-outline/section`  full-log section or turn Markdown lookup
  *    - `POST /md-outline/hide`     hide selected turns from UI & model context
  *    - `POST /md-outline/restore`  restore hidden turns back to UI & context
+ *    - `POST /md-outline/fork-turns` create a new Session containing only the selected turns
  */
 
-import { appendPluginRecord } from '@deepseek-ai/dsh-session';
+import { randomUUID } from 'node:crypto';
+import { appendPluginRecord, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session';
+import { openTurnClosers } from '@deepseek-ai/dsh-session/repair';
 
 const PROMPT_PREVIEW_LIMIT = 60;
 const HEADING_TEXT_LIMIT = 140;
@@ -756,6 +759,328 @@ const SEARCH_ROUTE_PATH = '/md-outline/search';
 const SECTION_ROUTE_PATH = '/md-outline/section';
 const HIDE_ROUTE_PATH = '/md-outline/hide';
 const RESTORE_ROUTE_PATH = '/md-outline/restore';
+const FORK_TURNS_ROUTE_PATH = '/md-outline/fork-turns';
+
+/**
+ * Check whether an event is a surface-replacement event.
+ * @param {object} event
+ * @returns {boolean}
+ */
+function isReplaceSurfaceOp(event) {
+  const op = event?.surfaceOp;
+  return op !== null && typeof op === 'object' && !Array.isArray(op) && op.op === 'replace';
+}
+
+/**
+ * Build a valid, contiguous Session seed containing only the selected turns
+ * from `events`, renumbering selected turns to `1..K` and event `seq`s to `0..M-1`
+ * while preserving the protected initial system prompt, request headers/context,
+ * user messages, assistant replies, tool calls/results, and closing any open tail.
+ *
+ * @param {ReadonlyArray<object>} events - source Session event log.
+ * @param {ReadonlyArray<number>} rawTurns - selected 1-based turn numbers.
+ * @returns {{ seed: object[], inheritedEventCount: number, selectedTurns: number[], firstPrompt: string }}
+ */
+function buildSelectedTurnsSeed(events, rawTurns) {
+  const wanted = new Set(
+    (Array.isArray(rawTurns) ? rawTurns : []).filter(
+      (t) => typeof t === 'number' && Number.isInteger(t) && t > 0,
+    ),
+  );
+  if (!Array.isArray(events) || events.length === 0 || wanted.size === 0) {
+    return { seed: [], inheritedEventCount: 0, selectedTurns: [], firstPrompt: '' };
+  }
+
+  // First pass: identify all turns present in the log and find the protected
+  // initial system/message (surface node 0) if the first selected turn is > 1.
+  const availableTurns = [];
+  const seenTurns = new Set();
+  let firstSystemEvent = null;
+
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    if (
+      firstSystemEvent === null &&
+      event.type === 'system/message' &&
+      event.surfaceOp === 'append'
+    ) {
+      firstSystemEvent = event;
+    }
+    if (event.type === 'turn/start' && typeof event.data?.turn === 'number') {
+      const t = event.data.turn;
+      if (wanted.has(t) && !seenTurns.has(t)) {
+        seenTurns.add(t);
+        availableTurns.push(t);
+      }
+    }
+  }
+
+  availableTurns.sort((a, b) => a - b);
+  if (availableTurns.length === 0) {
+    return { seed: [], inheritedEventCount: 0, selectedTurns: [], firstPrompt: '' };
+  }
+
+  const turnRemap = new Map();
+  availableTurns.forEach((oldTurn, idx) => {
+    turnRemap.set(oldTurn, idx + 1);
+  });
+
+  // Collect events belonging to the selected turns (plus pre-turn session setup
+  // such as agent-preset/selected or model/selection).
+  let currentTurn = null;
+  let currentStep = null;
+  let hasSystemHead = false;
+  let hasRequestHeader = false;
+  let latestHeaderBeforeSelection = null;
+  let latestContextBeforeSelection = null;
+  let firstPrompt = '';
+  const selectedRaw = [];
+
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    const type = event.type;
+
+    if (type === 'turn/start' && typeof event.data?.turn === 'number') {
+      currentTurn = event.data.turn;
+      currentStep = null;
+    } else if (type === 'step/start' && typeof event.data?.step === 'number') {
+      if (typeof event.data?.turn === 'number') currentTurn = event.data.turn;
+      currentStep = event.data.step;
+    }
+
+    // Track the latest request/header and request/context prior to or inside selected turns
+    if (type === 'request/header') {
+      latestHeaderBeforeSelection = event;
+    } else if (type === 'request/context') {
+      latestContextBeforeSelection = event;
+    }
+
+    // Preserve session-level preset/model/permission/sandbox configuration before turn 1
+    if (
+      currentTurn === null &&
+      (type === 'agent-preset/selected' ||
+        type === 'model/selection' ||
+        type === 'permission/preset' ||
+        type === 'sandbox/mode' ||
+        type === 'approval/policy')
+    ) {
+      selectedRaw.push({ event, mappedTurn: null, mappedStep: null });
+      continue;
+    }
+
+    const explicitTurn =
+      typeof event.data?.turn === 'number' && Number.isInteger(event.data.turn)
+        ? event.data.turn
+        : currentTurn;
+
+    if (explicitTurn === null || !turnRemap.has(explicitTurn)) {
+      if (type === 'step/end') currentStep = null;
+      if (type === 'turn/end') {
+        currentTurn = null;
+        currentStep = null;
+      }
+      continue;
+    }
+
+    const mappedTurn = turnRemap.get(explicitTurn);
+    const explicitStep =
+      typeof event.data?.step === 'number' && Number.isInteger(event.data.step)
+        ? event.data.step
+        : currentStep;
+
+    // Skip events that depend on cross-turn surface state or background side-channels
+    if (
+      type === 'compaction/start' ||
+      type === 'compaction/summary' ||
+      type === 'compaction/end' ||
+      type === 'compaction/prune' ||
+      type === 'session/title' ||
+      type === 'session/title-llm-request' ||
+      type === 'session/end-seed' ||
+      type === 'session-log-deepseek/delivery-accepted' ||
+      type === 'agent/inbox/spliced' ||
+      type === 'image/offload' ||
+      type === 'subagent/catalog' ||
+      type === 'subagent/descriptor' ||
+      type === 'command/run' ||
+      type === 'command/done' ||
+      type === 'llm/retry' ||
+      type === 'llm/retry-started' ||
+      type === HIDE_RECORD ||
+      type === RESTORE_RECORD
+    ) {
+      continue;
+    }
+
+    // Skip surface replacements (such as compact-checkpoint or in-place system prompt rewrites)
+    if (isReplaceSurfaceOp(event)) {
+      continue;
+    }
+
+    // Skip developer tool-addition/removal delta messages (the normalized request/header
+    // already carries the complete tool list for the turn).
+    if (type === 'developer/message') {
+      continue;
+    }
+
+    // Ensure the very first selected step has the protected system prompt at surface head
+    // and a valid initial request/header before any step/provider events.
+    if (type === 'step/start') {
+      selectedRaw.push({ event, mappedTurn, mappedStep: explicitStep });
+      if (!hasSystemHead && firstSystemEvent !== null) {
+        hasSystemHead = true;
+        selectedRaw.push({
+          event: firstSystemEvent,
+          mappedTurn,
+          mappedStep: explicitStep ?? 1,
+          forceAppendSystem: true,
+        });
+      }
+      if (!hasRequestHeader && latestHeaderBeforeSelection !== null) {
+        hasRequestHeader = true;
+        selectedRaw.push({
+          event: latestHeaderBeforeSelection,
+          mappedTurn,
+          mappedStep: explicitStep ?? 1,
+          forceInitialHeader: true,
+        });
+        if (latestContextBeforeSelection !== null) {
+          selectedRaw.push({
+            event: latestContextBeforeSelection,
+            mappedTurn,
+            mappedStep: explicitStep ?? 1,
+          });
+        }
+      }
+      continue;
+    }
+
+    if (type === 'system/message') {
+      if (hasSystemHead) {
+        // Avoid duplicate append system/messages when we already synthesized the head
+        if (selectedRaw.some((r) => r.event === event)) continue;
+      }
+      hasSystemHead = true;
+    }
+
+    if (type === 'request/header') {
+      if (hasRequestHeader && selectedRaw.some((r) => r.event === event)) {
+        continue;
+      }
+      hasRequestHeader = true;
+    }
+
+    if (
+      firstPrompt === '' &&
+      type === 'user/message' &&
+      event.data?.source?.kind === 'user'
+    ) {
+      firstPrompt = previewPrompt(event.data.content);
+    }
+
+    selectedRaw.push({ event, mappedTurn, mappedStep: explicitStep });
+
+    if (type === 'step/end') currentStep = null;
+    if (type === 'turn/end') {
+      currentTurn = null;
+      currentStep = null;
+    }
+  }
+
+  if (selectedRaw.length === 0) {
+    return { seed: [], inheritedEventCount: 0, selectedTurns: [], firstPrompt: '' };
+  }
+
+  // Second pass: assign contiguous seqs 0..K-1, remap turn coordinates and
+  // earlier sourceEventSeqs, and normalize the first request/header to reason: 'initial'.
+  const oldToNewSeq = new Map();
+  const prefix = [];
+  let seenFirstHeader = false;
+
+  for (const item of selectedRaw) {
+    const { event, mappedTurn } = item;
+    const newSeq = SessionSeq(prefix.length);
+    if (typeof event.seq === 'number' && !oldToNewSeq.has(event.seq)) {
+      oldToNewSeq.set(event.seq, newSeq);
+    }
+
+    let data = structuredClone(event.data);
+    if (
+      mappedTurn !== null &&
+      data !== null &&
+      typeof data === 'object' &&
+      !Array.isArray(data)
+    ) {
+      if (typeof data.turn === 'number' || item.forceAppendSystem) {
+        data.turn = mappedTurn;
+      }
+      if (item.forceAppendSystem && typeof item.mappedStep === 'number') {
+        data.step = item.mappedStep;
+      }
+    }
+
+    if (event.type === 'request/header' && data && typeof data === 'object') {
+      if (!seenFirstHeader || item.forceInitialHeader) {
+        seenFirstHeader = true;
+        data = {
+          header: data.header,
+          reason: 'initial',
+        };
+      }
+    }
+
+    const rebuilt = {
+      type: event.type,
+      seq: newSeq,
+      time: typeof event.time === 'number' ? event.time : Date.now(),
+      data,
+    };
+
+    if (event.ignorable === true) {
+      rebuilt.ignorable = true;
+    }
+
+    if (event.surfaceOp === 'append' || item.forceAppendSystem) {
+      rebuilt.surfaceOp = 'append';
+    }
+
+    if (Array.isArray(event.sourceEventSeqs) && event.type !== 'assistant/message') {
+      const remappedSources = [];
+      for (const oldRef of event.sourceEventSeqs) {
+        const mappedRef = oldToNewSeq.get(oldRef);
+        if (mappedRef !== undefined && mappedRef < newSeq && !remappedSources.includes(mappedRef)) {
+          remappedSources.push(mappedRef);
+        }
+      }
+      if (remappedSources.length > 0) {
+        rebuilt.sourceEventSeqs = remappedSources;
+      }
+    }
+
+    prefix.push(rebuilt);
+  }
+
+  const lastSeq = prefix.length - 1;
+  const lastTime = prefix[lastSeq]?.time ?? Date.now();
+  const inheritedEventCount = prefix.length;
+
+  prefix.push({
+    type: 'session/end-seed',
+    seq: SessionSeq(lastSeq + 1),
+    time: lastTime,
+    data: { inherited: true },
+  });
+
+  const closers = openTurnClosers(prefix, { kind: 'forked' });
+  const seed = prefix.concat(closers);
+
+  return {
+    seed,
+    inheritedEventCount,
+    selectedTurns: availableTurns,
+    firstPrompt,
+  };
+}
 
 const MAX_BODY_HITS = 80;
 const SNIPPET_RADIUS = 36;
@@ -1635,6 +1960,149 @@ export function apply(ctx) {
         },
       }),
     );
+
+    // Create a brand-new Session whose durable conversation history contains
+    // only the user-selected turns from the source Session.
+    scope.effect(() =>
+      scope.webServer.register({
+        kind: 'exact',
+        path: FORK_TURNS_ROUTE_PATH,
+        handler: async (req, res) => {
+          if (reject(req, res)) return;
+          const parsed = await readBody(req, res);
+          if (parsed === null) return;
+          const turns = integerList(parsed.body.turns);
+          if (turns.length === 0) {
+            sendJson(res, 400, {
+              code: 'bad-request',
+              message: 'turns must be a non-empty array of integers',
+            });
+            return;
+          }
+
+          let observation;
+          try {
+            observation = await scope.sessionQuery.observeSession(parsed.sessionId);
+            const sourceHeader = observation.header;
+            const built = buildSelectedTurnsSeed(observation.events, turns);
+            if (built.seed.length === 0 || built.selectedTurns.length === 0) {
+              sendJson(res, 409, {
+                code: 'no-turns-found',
+                message: 'none of the selected turns exist in the source session',
+              });
+              return;
+            }
+
+            const agents = scope.get?.('agents');
+            if (!agents || typeof agents.create !== 'function') {
+              sendJson(res, 500, {
+                code: 'agents-unavailable',
+                message: 'agent registry is unavailable on this host',
+              });
+              return;
+            }
+
+            const defaultModel = scope.get?.('agentDefaultModel');
+            const currentSelection =
+              typeof defaultModel?.currentSelection === 'function'
+                ? defaultModel.currentSelection()
+                : { provider: 'deepseek', model: 'deepseek-chat' };
+
+            const sessionController = scope.get?.('sessionController');
+            const apiAgents = sessionController?.agents;
+            const presetId =
+              observation.projections?.values?.agentPreset ??
+              sourceHeader?.agentPreset ??
+              undefined;
+            let composition = {
+              agentPreset: presetId,
+              setup: undefined,
+            };
+            if (apiAgents && typeof apiAgents.composeAgent === 'function') {
+              try {
+                composition = await apiAgents.composeAgent(presetId);
+              } catch (_err) {
+                // Fall back to default setup when preset resolution fails
+              }
+            }
+
+            const childId = `session-${randomUUID()}`;
+            const createdHandle = await agents.create({
+              sessionId: childId,
+              seed: built.seed,
+              inheritedEventCount: SessionLogOffset(built.inheritedEventCount),
+              meta: {
+                ...(sourceHeader?.cwd === undefined ? {} : { cwd: sourceHeader.cwd }),
+                parentSession: sourceHeader.id,
+                isSeeded: true,
+                ...(composition.agentPreset === undefined
+                  ? {}
+                  : { agentPreset: composition.agentPreset }),
+              },
+              agentOptions: {
+                provider: currentSelection.provider,
+                model: currentSelection.model,
+              },
+              ...(typeof composition.setup === 'function' ? { setup: composition.setup } : {}),
+            });
+
+            // Attach the new Session to the same Workspace as the source Session
+            const workspaceRegistry = scope.get?.('workspaceRegistry');
+            if (workspaceRegistry && typeof workspaceRegistry.list === 'function') {
+              const workspaces = workspaceRegistry.list();
+              let targetWorkspace = workspaces.find(
+                (ws) => Array.isArray(ws.sessionIds) && ws.sessionIds.includes(sourceHeader.id),
+              );
+              if (!targetWorkspace && sourceHeader?.cwd) {
+                targetWorkspace = workspaces.find((ws) => ws.path === sourceHeader.cwd);
+              }
+              if (targetWorkspace && typeof targetWorkspace.attachSession === 'function') {
+                await targetWorkspace.attachSession(childId);
+              }
+            }
+
+            // Assign a clear title to the branched Session
+            const sessionTitle = scope.get?.('sessionTitle');
+            const sourceTitle = observation.projections?.values?.title;
+            const customTitle =
+              typeof parsed.body.title === 'string' ? parsed.body.title.trim() : '';
+            const turnBadge =
+              built.selectedTurns.length <= 3
+                ? `#${built.selectedTurns.join(', #')}`
+                : `#${built.selectedTurns[0]}..#${built.selectedTurns.at(-1)} (${built.selectedTurns.length})`;
+            const baseTitle =
+              customTitle ||
+              (typeof sourceTitle === 'string' && sourceTitle.trim() !== ''
+                ? `${sourceTitle.trim()} [${turnBadge}]`
+                : built.firstPrompt
+                  ? `${built.firstPrompt} [${turnBadge}]`
+                  : `精选对话 [${turnBadge}]`);
+            if (sessionTitle && typeof sessionTitle.rename === 'function' && createdHandle?.agent?.session) {
+              try {
+                sessionTitle.rename(createdHandle.agent.session, baseTitle);
+              } catch (_err) {
+                // Non-fatal if title normalization rejects
+              }
+            }
+
+            sendJson(res, 200, {
+              sessionId: childId,
+              turns: built.selectedTurns,
+              title: baseTitle,
+            });
+          } catch (error) {
+            sendJson(res, 500, {
+              code: 'fork-turns-failed',
+              message: error instanceof Error ? error.message : 'failed to create session from selected turns',
+            });
+          } finally {
+            if (observation && typeof observation[Symbol.dispose] === 'function') {
+              observation[Symbol.dispose]();
+            }
+          }
+        },
+      }),
+    );
   });
 
   ctx.inject(['webServer', 'connection', 'sessionQuery'], (scope) => {
@@ -1771,6 +2239,7 @@ export const internals = {
   renderHiddenContext,
   buildHideMessage,
   buildRestoreMessage,
+  buildSelectedTurnsSeed,
   HIDE_RECORD,
   RESTORE_RECORD,
 };
