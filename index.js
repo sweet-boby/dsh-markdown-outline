@@ -19,8 +19,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { appendPluginRecord, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session';
-import { openTurnClosers } from '@deepseek-ai/dsh-session/repair';
+import { appendPluginRecord, buildForkSeed, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session';
 
 const PROMPT_PREVIEW_LIMIT = 60;
 const HEADING_TEXT_LIMIT = 140;
@@ -1061,18 +1060,8 @@ function buildSelectedTurnsSeed(events, rawTurns) {
   }
 
   const lastSeq = prefix.length - 1;
-  const lastTime = prefix[lastSeq]?.time ?? Date.now();
   const inheritedEventCount = prefix.length;
-
-  prefix.push({
-    type: 'session/end-seed',
-    seq: SessionSeq(lastSeq + 1),
-    time: lastTime,
-    data: { inherited: true },
-  });
-
-  const closers = openTurnClosers(prefix, { kind: 'forked' });
-  const seed = prefix.concat(closers);
+  const seed = buildForkSeed(prefix, SessionSeq(lastSeq));
 
   return {
     seed,

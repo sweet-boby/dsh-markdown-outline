@@ -29,6 +29,17 @@ export function SessionLogOffset(n) {
   return n
 }
 
+export function buildForkSeed(events, boundary) {
+  const prefix = events.slice(0, boundary + 1)
+  prefix.push({
+    type: 'session/end-seed',
+    seq: boundary + 1,
+    time: events[boundary]?.time ?? 0,
+    data: { inherited: true },
+  })
+  return prefix.concat(openTurnClosers(prefix, { kind: 'forked' }))
+}
+
 export function openTurnClosers(events, cause = { kind: 'forked' }) {
   let openTurn = null
   let openStep = null
