@@ -4,6 +4,12 @@ English | [中文](README.zh.md)
 
 A Feishu-style Markdown outline for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): every Markdown heading an AI reply contains becomes a collapsible table of contents in an independent split column on the left of the conversation page, with built-in heading and reply-body search across the entire session log, native `@` reference chips for multi-selected sections, and reversible turn hiding.
 
+## Preview
+
+The outline groups replies by conversation turn and displays their Markdown headings in a collapsible tree, with search and section selection at the top.
+
+<img src="assets/outline-preview.webp" alt="Installed plugin showing the conversation outline, reply headings, search field, and section selection button" width="360" />
+
 ## Features
 
 - **Whole-session outline.** Headings come from a Host session projection folding the complete Session log, so replies scrolled out of the loaded window still appear in the outline. Clicking one pages history in on demand.
